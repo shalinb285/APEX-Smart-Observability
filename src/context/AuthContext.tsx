@@ -1,7 +1,7 @@
 
 // APEX Authentication & Identity Context
-// OIDC-compatible session handling with in-memory token vaults.
-// Does NOT store private encryption keys or access tokens in plaintext in localStorage.
+// Secure session handling with in-memory token management.
+// MFA must be verified by the backend before granting full access.
 
 import React, {
   createContext,
@@ -11,7 +11,7 @@ import React, {
   useCallback,
 } from 'react';
 
-import { User, UserRole, AuthTokens } from '../types/saas';
+import { User, AuthTokens } from '../types/saas';
 import { saasApi } from '../services/saasApi';
 import { keyManager } from '../services/crypto/keyManager';
 import {
@@ -44,7 +44,9 @@ interface AuthContextType {
   acceptInvitation: (invitationId: string) => Promise<boolean>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextType | undefined>(
+  undefined
+);
 
 export const AuthProvider: React.FC<{
   children: React.ReactNode;
@@ -53,6 +55,19 @@ export const AuthProvider: React.FC<{
   const [user, setUser] = useState<User | null>(null);
   const [tokens, setTokens] = useState<AuthTokens | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+
+  // ==========================================
+  // CLEAR LOCAL AUTHENTICATION STATE
+  // ==========================================
+
+  const clearSession = useCallback(() => {
+    setAccessToken(null);
+
+    setUser(null);
+    setTokens(null);
+
+    keyManager.lockAndPurgeVault();
+  }, []);
 
   // ==========================================
   // INITIALIZE EXISTING SESSION
@@ -65,16 +80,21 @@ export const AuthProvider: React.FC<{
       try {
         const token = getAccessToken();
 
-        // Do not call /me without an access token.
-        if (!token) {
-          return;
-        }
+        if (!token) return;
 
         // Validate the existing backend session.
         const currentUser = await saasApi.getCurrentUser();
 
         if (!mounted) return;
 
+        // MFA-enabled accounts must not enter the
+        // application without verified MFA.
+        if (currentUser.mfaEnabled) {
+          clearSession();
+          return;
+        }
+
+        // Establish the authenticated session.
         setUser(currentUser);
 
         setTokens({
@@ -83,18 +103,20 @@ export const AuthProvider: React.FC<{
           expiresIn: 3600,
         });
 
-        // Unlock organization encryption vault.
-        await keyManager.unlockVault(currentUser.currentOrgId);
+        // Unlock encryption vault only after
+        // successful authentication.
+        await keyManager.unlockVault(
+          currentUser.currentOrgId
+        );
 
       } catch (error) {
-        console.warn('Session initialization failed:', error);
-
-        // Clear invalid or expired session.
-        setAccessToken(null);
+        console.warn(
+          'Session initialization failed:',
+          error
+        );
 
         if (mounted) {
-          setUser(null);
-          setTokens(null);
+          clearSession();
         }
 
       } finally {
@@ -109,10 +131,11 @@ export const AuthProvider: React.FC<{
     return () => {
       mounted = false;
     };
-  }, []);
+
+  }, [clearSession]);
 
   // ==========================================
-  // REAL BACKEND LOGIN
+  // BACKEND LOGIN
   // ==========================================
 
   const login = useCallback(
@@ -122,20 +145,63 @@ export const AuthProvider: React.FC<{
         throw new Error('Password is required');
       }
 
+      // Remove any previous partial session.
+      clearSession();
+
       try {
+
         // STEP 1: Authenticate with FastAPI.
         const authResponse = await saasApi.login(
           email,
           password
         );
 
-        // STEP 2: Store genuine backend access token.
-        // saasApi.login already calls setAccessToken().
-        const accessToken = authResponse.access_token;
+        // STEP 2: Check whether backend requires MFA.
+        // The backend should return an MFA challenge,
+        // NOT a fully privileged access token.
+        const mfaRequired =
+          authResponse?.mfa_required === true ||
+          authResponse?.mfaRequired === true;
+
+        if (mfaRequired) {
+          clearSession();
+
+          return {
+            mfaRequired: true,
+          };
+        }
+
+        // STEP 3: Obtain backend access token.
+        const accessToken = authResponse?.access_token;
 
         if (!accessToken) {
-          throw new Error('Backend did not return an access token');
+          throw new Error(
+            'Authentication response did not contain an access token.'
+          );
         }
+
+        // Store token temporarily for profile validation.
+        setAccessToken(accessToken);
+
+        // STEP 4: Fetch authenticated user profile.
+        const currentUser = await saasApi.getCurrentUser();
+
+        // Fail closed if the account requires MFA.
+        if (currentUser.mfaEnabled) {
+          clearSession();
+
+          return {
+            mfaRequired: true,
+          };
+        }
+
+        // STEP 5: Unlock organization encryption vault.
+        await keyManager.unlockVault(
+          currentUser.currentOrgId
+        );
+
+        // STEP 6: Establish application session.
+        setUser(currentUser);
 
         setTokens({
           accessToken,
@@ -143,34 +209,19 @@ export const AuthProvider: React.FC<{
           expiresIn: 3600,
         });
 
-        // STEP 3: Fetch authenticated user details.
-        const currentUser = await saasApi.getCurrentUser();
-
-        setUser(currentUser);
-
-        // STEP 4: Unlock organization encryption vault.
-        await keyManager.unlockVault(
-          currentUser.currentOrgId
-        );
-
-        // Preserve existing MFA interface.
         return {
-          mfaRequired: currentUser.mfaEnabled,
+          mfaRequired: false,
         };
 
       } catch (error) {
 
-        // Authentication failed: clear partial session.
-        setAccessToken(null);
-        setUser(null);
-        setTokens(null);
-
-        keyManager.lockAndPurgeVault();
+        // Never preserve partially authenticated state.
+        clearSession();
 
         throw error;
       }
     },
-    []
+    [clearSession]
   );
 
   // ==========================================
@@ -178,15 +229,15 @@ export const AuthProvider: React.FC<{
   // ==========================================
 
   const completeMfa = useCallback(
-    async (code: string) => {
+    async (_code: string): Promise<boolean> => {
 
-      // Existing demo validation.
-      // Actual server-side MFA verification
-      // must be connected separately.
+      // MFA verification is intentionally disabled
+      // until a real backend verification endpoint
+      // and challenge-based authentication flow exist.
 
-      if (code && /^\d{6}$/.test(code)) {
-        return true;
-      }
+      console.error(
+        'MFA verification is not connected to the backend.'
+      );
 
       return false;
     },
@@ -199,29 +250,14 @@ export const AuthProvider: React.FC<{
 
   const register = useCallback(
     async (
-      fullName: string,
-      email: string,
-      password?: string
+      _fullName: string,
+      _email: string,
+      _password?: string
     ) => {
 
-      // Existing mock registration implementation.
-      const newUser: User = {
-        id: `usr-${Date.now().toString(36)}`,
-        email,
-        fullName,
-        emailVerified: false,
-        mfaEnabled: false,
-        currentOrgId: 'org-apex-enterprise',
-        roles: {
-          'org-apex-enterprise': 'Engineer',
-        },
-        createdAt: new Date().toISOString(),
-      };
-
-      setUser(newUser);
-
-      await keyManager.unlockVault(
-        newUser.currentOrgId
+      // Do not create fake frontend-only accounts.
+      throw new Error(
+        'Registration is not yet connected to the backend.'
       );
     },
     []
@@ -232,26 +268,17 @@ export const AuthProvider: React.FC<{
   // ==========================================
 
   const logout = useCallback(async () => {
-
-    // Clear backend access token.
-    setAccessToken(null);
-
-    // Purge cryptographic vault.
-    keyManager.lockAndPurgeVault();
-
-    setUser(null);
-    setTokens(null);
-
-  }, []);
+    clearSession();
+  }, [clearSession]);
 
   // ==========================================
   // PASSWORD RESET
   // ==========================================
 
   const requestPasswordReset = useCallback(
-    async (email: string) => {
-      console.info(
-        `Password reset dispatched for ${email}`
+    async (_email: string) => {
+      throw new Error(
+        'Password reset is not yet connected to the backend.'
       );
     },
     []
@@ -262,22 +289,11 @@ export const AuthProvider: React.FC<{
   // ==========================================
 
   const verifyEmail = useCallback(
-    async (token: string) => {
-
-      if (token) {
-        if (user) {
-          setUser({
-            ...user,
-            emailVerified: true,
-          });
-        }
-
-        return true;
-      }
-
+    async (_token: string): Promise<boolean> => {
+      // A real backend verification endpoint is required.
       return false;
     },
-    [user]
+    []
   );
 
   // ==========================================
@@ -285,8 +301,9 @@ export const AuthProvider: React.FC<{
   // ==========================================
 
   const acceptInvitation = useCallback(
-    async (invitationId: string) => {
-      return !!invitationId;
+    async (_invitationId: string): Promise<boolean> => {
+      // A real backend invitation endpoint is required.
+      return false;
     },
     []
   );
