@@ -1,96 +1,154 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Wrench,
-  RotateCcw,
-  Zap,
-  Layers,
-  Trash2,
   PlayCircle,
   Clock,
   ShieldCheck,
   AlertTriangle,
-  CheckCircle2,
-  FileText,
   ChevronDown,
   ChevronRight,
   Terminal,
+  RefreshCw,
 } from 'lucide-react';
-import { RemediationAction, RemediationHistoryItem } from '../types';
+import type { RemediationAction, RemediationHistoryItem } from '../types';
 import { api } from '../services/api';
-import { Card, CardHeader, CardTitle, CardDescription } from '../components/ui/Card';
+import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
-import { StatusPill } from '../components/ui/StatusPill';
 import { Modal } from '../components/ui/Modal';
 import { useMonitoring } from '../context/MonitoringContext';
+
+/**
+ * API responses may be a direct array or an envelope such as
+ * { data: [...] }, { items: [...] }, or { results: [...] }.
+ * Never pass an unknown API response directly to Array.map().
+ */
+function asArray<T>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    for (const key of ['items', 'results', 'actions', 'history', 'data']) {
+      const nested = record[key];
+      if (Array.isArray(nested)) return nested as T[];
+      if (nested && typeof nested === 'object') {
+        const extracted = asArray<T>(nested);
+        if (extracted.length > 0) return extracted;
+      }
+    }
+  }
+  return [];
+}
+
+const safeText = (value: unknown, fallback = '—'): string => {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return fallback;
+};
+
+const safeRisk = (value: unknown): 'high' | 'medium' | 'low' => {
+  const risk = String(value ?? 'low').toLowerCase();
+  if (risk === 'high' || risk === 'critical') return 'high';
+  if (risk === 'medium' || risk === 'warning') return 'medium';
+  return 'low';
+};
+
+const riskBadgeVariant = (risk: unknown): 'critical' | 'warning' | 'healthy' => {
+  const normalized = safeRisk(risk);
+  return normalized === 'high' ? 'critical' : normalized === 'medium' ? 'warning' : 'healthy';
+};
 
 export const RemediationPage: React.FC = () => {
   const [actions, setActions] = useState<RemediationAction[]>([]);
   const [history, setHistory] = useState<RemediationHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [confirmModalAction, setConfirmModalAction] = useState<RemediationAction | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
-  const [expandedLogId, setExpandedLogId] = useState<string | null>('rem-hist-101');
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const { showNotification, refreshOverview } = useMonitoring();
 
-  const loadRemediationData = async () => {
+  const loadRemediationData = useCallback(async () => {
     setLoading(true);
+    setLoadError('');
     try {
-      const [acts, hist] = await Promise.all([
+      const [actionsResponse, historyResponse] = await Promise.all([
         api.getRemediationActions(),
         api.getRemediationHistory(),
       ]);
-      setActions(acts);
-      setHistory(hist);
-    } catch (e) {
-      console.error(e);
+
+      const safeActions = asArray<RemediationAction>(actionsResponse);
+      const safeHistory = asArray<RemediationHistoryItem>(historyResponse);
+      setActions(safeActions);
+      setHistory(safeHistory);
+      setExpandedLogId((current) => current ?? safeHistory[0]?.id ?? null);
+    } catch (error) {
+      console.error('Failed to load remediation data:', error);
+      setActions([]);
+      setHistory([]);
+      setLoadError('Could not load remediation data from the backend. You can retry.');
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    loadRemediationData();
   }, []);
 
+  useEffect(() => {
+    void loadRemediationData();
+  }, [loadRemediationData]);
+
   const handleExecuteConfirmed = async () => {
-    if (!confirmModalAction) return;
+    if (!confirmModalAction || isExecuting) return;
     setIsExecuting(true);
     try {
       const result = await api.executeRemediation(confirmModalAction.id);
-      setHistory((prev) => [result, ...prev]);
-      setExpandedLogId(result.id);
-      showNotification(`Executed "${confirmModalAction.title}" successfully. Target: ${confirmModalAction.targetService}`, 'success');
+      if (result && typeof result === 'object' && !Array.isArray(result)) {
+        const newItem = result as RemediationHistoryItem;
+        setHistory((previous) => [newItem, ...previous]);
+        if (newItem.id) setExpandedLogId(newItem.id);
+      } else {
+        await loadRemediationData();
+      }
+
+      showNotification(
+        `Remediation request submitted: ${safeText(confirmModalAction.title, 'Runbook')}`,
+        'success',
+      );
       setConfirmModalAction(null);
-      await refreshOverview();
-    } catch (e) {
-      showNotification('Remediation action failed', 'error');
+      try {
+        await refreshOverview();
+      } catch (refreshError) {
+        console.warn('Overview refresh after remediation failed:', refreshError);
+      }
+    } catch (error) {
+      console.error('Remediation execution failed:', error);
+      showNotification('Remediation action failed. Check backend logs and try again.', 'error');
     } finally {
       setIsExecuting(false);
     }
   };
 
-  const getActionIcon = (type: RemediationAction['type']) => {
-    return <Wrench className="w-5 h-5 text-white" />;
-  };
-
   return (
     <div className="space-y-6">
-      {/* Top Header */}
-      <div>
-        <h2 className="text-base font-bold font-mono tracking-tight text-white flex items-center gap-2">
-          <Wrench className="w-5 h-5 text-white" />
-          AUTOMATED REMEDIATION &amp; RECOVERY PLAYBOOKS
-        </h2>
-        <p className="text-xs text-zinc-400 mt-0.5">
-          Execute guarded corrective runbooks, auto-scale pods, drain connections, or rollback releases
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-base font-bold font-mono tracking-tight text-white">
+            <Wrench className="h-5 w-5 text-white" />
+            AUTOMATED REMEDIATION &amp; RECOVERY PLAYBOOKS
+          </h2>
+          <p className="mt-1 text-xs text-zinc-400">
+            Execute guarded corrective runbooks, auto-scale pods, drain connections, or rollback releases.
+          </p>
+        </div>
+        <Button variant="secondary" size="sm" onClick={() => void loadRemediationData()} disabled={loading}>
+          <span className="inline-flex items-center gap-2">
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </span>
+        </Button>
       </div>
 
-      {/* Available Remediation Actions Catalog */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-mono uppercase tracking-wider text-zinc-300 font-semibold">
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-mono font-semibold uppercase tracking-wider text-zinc-300">
             Standard Runbook Actions ({actions.length} Configured)
           </span>
           <span className="text-[11px] font-mono text-zinc-500">
@@ -98,131 +156,153 @@ export const RemediationPage: React.FC = () => {
           </span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {actions.map((act) => (
-            <Card key={act.id} className="flex flex-col justify-between space-y-4 hover:border-zinc-600 transition-all">
-              <div className="space-y-2.5 font-mono">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="p-2 rounded-xl bg-zinc-900 border border-zinc-800">
-                    {getActionIcon(act.type)}
+        {loading ? (
+          <Card>
+            <p className="text-sm text-zinc-400">Loading remediation runbooks…</p>
+          </Card>
+        ) : loadError ? (
+          <Card>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-amber-300">{loadError}</p>
+              <Button variant="secondary" size="sm" onClick={() => void loadRemediationData()}>
+                Retry
+              </Button>
+            </div>
+          </Card>
+        ) : actions.length === 0 ? (
+          <Card>
+            <div className="flex items-center gap-3 text-sm text-zinc-400">
+              <AlertTriangle className="h-5 w-5 shrink-0" />
+              No remediation runbooks are currently available.
+            </div>
+          </Card>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {actions.map((action, index) => {
+              const id = safeText(action?.id, `runbook-${index}`);
+              const risk = safeRisk(action?.riskLevel);
+              return (
+                <Card key={id} className="flex flex-col justify-between space-y-4 transition-all hover:border-zinc-600">
+                  <div className="space-y-2.5 font-mono">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-2">
+                        <Wrench className="h-5 w-5 text-white" />
+                      </div>
+                      <Badge variant={riskBadgeVariant(risk)}>RISK: {risk.toUpperCase()}</Badge>
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold leading-snug text-white">
+                        {safeText(action?.title, 'Untitled runbook')}
+                      </h4>
+                      <span className="text-[11px] font-semibold text-zinc-300">
+                        Target: {safeText(action?.targetService)}
+                      </span>
+                    </div>
+                    <p className="font-sans text-xs leading-relaxed text-zinc-300">
+                      {safeText(action?.description, 'No description provided.')}
+                    </p>
+                    <div className="flex items-center gap-1.5 pt-1 text-[10px] text-zinc-400">
+                      <Clock className="h-3 w-3" />
+                      Estimated runtime: {safeText(action?.estimatedDuration)}
+                    </div>
                   </div>
-                  <Badge variant={act.riskLevel === 'high' ? 'critical' : act.riskLevel === 'medium' ? 'warning' : 'healthy'}>
-                    RISK: {act.riskLevel.toUpperCase()}
-                  </Badge>
-                </div>
+                  <div className="flex items-center justify-end border-t border-zinc-800 pt-3">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setConfirmModalAction(action)}
+                      icon={<PlayCircle className="h-3.5 w-3.5" />}
+                      className="w-full justify-center text-xs font-mono hover:bg-zinc-800"
+                    >
+                      TRIGGER RUNBOOK
+                    </Button>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
-                <div>
-                  <h4 className="text-sm font-bold text-white leading-snug">{act.title}</h4>
-                  <span className="text-[11px] text-zinc-300 font-semibold">
-                    Target: {act.targetService}
-                  </span>
-                </div>
-
-                <p className="text-xs text-zinc-300 font-sans leading-relaxed">
-                  {act.description}
-                </p>
-
-                <div className="text-[10px] text-zinc-400 flex items-center gap-1.5 pt-1">
-                  <Clock className="w-3 h-3 text-zinc-400" />
-                  Estimated runtime: {act.estimatedDuration}
-                </div>
-              </div>
-
-              <div className="pt-3 border-t border-zinc-800 flex items-center justify-end">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setConfirmModalAction(act)}
-                  icon={<PlayCircle className="w-3.5 h-3.5" />}
-                  className="w-full text-xs font-mono justify-center hover:bg-zinc-800"
-                >
-                  TRIGGER RUNBOOK
-                </Button>
-              </div>
-            </Card>
-          ))}
-        </div>
-      </div>
-
-      {/* Remediation Audit History Table */}
       <Card noPadding>
-        <div className="px-5 py-4 border-b border-zinc-800 flex items-center justify-between bg-black">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 bg-black px-5 py-4">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-white" />
-            <h3 className="text-xs font-mono uppercase tracking-wider text-white font-semibold">
+            <ShieldCheck className="h-4 w-4 text-white" />
+            <h3 className="text-xs font-mono font-semibold uppercase tracking-wider text-white">
               Remediation Execution History &amp; Before/After Health
             </h3>
           </div>
-          <span className="text-[11px] font-mono text-zinc-400">
-            Immutable audit log with console execution traces
-          </span>
+          <span className="text-[11px] font-mono text-zinc-400">Execution traces and audit history</span>
         </div>
 
         <div className="divide-y divide-zinc-800/80 font-mono text-xs">
-          {history.map((item) => {
-            const isExpanded = expandedLogId === item.id;
-            const isSuccess = item.status === 'success';
-
-            return (
-              <div key={item.id} className="transition-colors">
-                <div
-                  onClick={() => setExpandedLogId(isExpanded ? null : item.id)}
-                  className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-zinc-900/60 cursor-pointer select-none"
-                >
-                  <div className="flex items-center gap-3">
-                    <button className="text-zinc-500 hover:text-white">
-                      {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                    </button>
-
-                    <Badge variant={isSuccess ? 'healthy' : 'critical'}>
-                      {item.status.toUpperCase()}
-                    </Badge>
-
-                    <div>
-                      <span className="font-semibold text-white">{item.actionTitle}</span>
-                      <div className="text-[11px] text-zinc-400">
-                        Target: <span className="text-zinc-200">{item.targetService}</span> | Actor: {item.executedBy}
+          {loading ? (
+            <p className="px-5 py-6 text-zinc-400">Loading execution history…</p>
+          ) : history.length === 0 ? (
+            <p className="px-5 py-6 text-zinc-400">No remediation executions have been recorded.</p>
+          ) : (
+            history.map((item, index) => {
+              const id = safeText(item?.id, `history-${index}`);
+              const isExpanded = expandedLogId === id;
+              const status = safeText(item?.status, 'unknown');
+              const isSuccess = status.toLowerCase() === 'success';
+              return (
+                <div key={id} className="transition-colors">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedLogId(isExpanded ? null : id)}
+                    aria-expanded={isExpanded}
+                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-zinc-900/60"
+                  >
+                    <div className="flex min-w-0 items-center gap-3">
+                      {isExpanded ? (
+                        <ChevronDown className="h-4 w-4 shrink-0 text-zinc-400" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 shrink-0 text-zinc-400" />
+                      )}
+                      <Badge variant={isSuccess ? 'healthy' : 'critical'}>{status.toUpperCase()}</Badge>
+                      <div className="min-w-0">
+                        <span className="block truncate font-semibold text-white">
+                          {safeText(item?.actionTitle, 'Remediation action')}
+                        </span>
+                        <div className="text-[11px] text-zinc-400">
+                          Target: <span className="text-zinc-200">{safeText(item?.targetService)}</span>
+                          {' | '}Actor: {safeText(item?.executedBy)}
+                        </div>
                       </div>
                     </div>
-                  </div>
-
-                  <div className="flex items-center gap-6 text-right">
-                    <div className="hidden md:block">
-                      <div className="text-[11px] text-zinc-500 line-through">
-                        {item.beforeHealth}
+                    <div className="flex shrink-0 items-center gap-6 text-right">
+                      <div className="hidden md:block">
+                        <div className="text-[11px] text-zinc-500 line-through">{safeText(item?.beforeHealth)}</div>
+                        <div className="text-[11px] font-bold text-white">→ {safeText(item?.afterHealth)}</div>
                       </div>
-                      <div className="text-[11px] text-white font-bold">
-                        &rarr; {item.afterHealth}
-                      </div>
+                      <span className="text-[11px] text-zinc-400">{safeText(item?.timestamp)}</span>
                     </div>
-                    <span className="text-zinc-400 text-[11px] shrink-0">{item.timestamp}</span>
-                  </div>
+                  </button>
+                  {isExpanded && (
+                    <div className="space-y-2 border-t border-zinc-800 bg-zinc-950 px-6 py-4">
+                      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                        <Terminal className="h-3.5 w-3.5 text-white" />
+                        Execution Output Trace
+                      </span>
+                      <pre className="overflow-x-auto rounded-lg border border-zinc-800 bg-black p-3 text-xs leading-relaxed text-zinc-200">
+                        {safeText(item?.logOutput, 'No execution output was recorded.')}
+                      </pre>
+                    </div>
+                  )}
                 </div>
-
-                {isExpanded && (
-                  <div className="px-6 py-4 bg-zinc-950 border-t border-zinc-800 space-y-2">
-                    <span className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold flex items-center gap-1.5">
-                      <Terminal className="w-3.5 h-3.5 text-white" />
-                      Execution Shell Output Trace
-                    </span>
-                    <pre className="p-3 rounded-lg bg-black border border-zinc-800 text-zinc-200 text-xs overflow-x-auto leading-relaxed">
-                      {item.logOutput}
-                    </pre>
-                  </div>
-                )}
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
       </Card>
 
-      {/* Safety Confirmation Modal */}
       {confirmModalAction && (
         <Modal
-          isOpen={!!confirmModalAction}
-          onClose={() => setConfirmModalAction(null)}
-          title={`CONFIRM REMEDIATION // ${confirmModalAction.id}`}
-          subtitle={`Target: ${confirmModalAction.targetService} | Risk Level: ${confirmModalAction.riskLevel.toUpperCase()}`}
+          isOpen={Boolean(confirmModalAction)}
+          onClose={() => !isExecuting && setConfirmModalAction(null)}
+          title={`CONFIRM REMEDIATION // ${safeText(confirmModalAction.id)}`}
+          subtitle={`Target: ${safeText(confirmModalAction.targetService)} | Risk Level: ${safeRisk(confirmModalAction.riskLevel).toUpperCase()}`}
           maxWidth="md"
           footer={
             <>
@@ -239,6 +319,7 @@ export const RemediationPage: React.FC = () => {
                 size="sm"
                 isLoading={isExecuting}
                 onClick={handleExecuteConfirmed}
+                disabled={isExecuting}
               >
                 Authorize &amp; Execute
               </Button>
@@ -246,26 +327,23 @@ export const RemediationPage: React.FC = () => {
           }
         >
           <div className="space-y-4 font-mono text-xs">
-            <div className="p-3.5 rounded-lg bg-zinc-900 border border-zinc-700 flex items-start gap-3 text-zinc-200">
-              <AlertTriangle className="w-5 h-5 text-white shrink-0 mt-0.5" />
+            <div className="flex items-start gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-3.5 text-zinc-200">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
               <div>
                 <strong className="block font-bold text-white">Safety Confirmation Gate</strong>
-                Executing this playbook directly modifies container topology or service processes.
-                Ensure standby redundancy is active.
+                This runbook may modify service or infrastructure state. Confirm that you intend to execute it.
               </div>
             </div>
-
-            <div className="p-3 rounded-lg bg-black border border-zinc-800 space-y-1.5">
-              <span className="text-zinc-500 uppercase text-[10px]">Action Specification</span>
-              <p className="text-sm font-bold text-white">{confirmModalAction.title}</p>
-              <p className="text-xs text-zinc-300 font-sans leading-relaxed">
-                {confirmModalAction.description}
+            <div className="space-y-1.5 rounded-lg border border-zinc-800 bg-black p-3">
+              <span className="text-[10px] uppercase text-zinc-500">Action Specification</span>
+              <p className="text-sm font-bold text-white">{safeText(confirmModalAction.title)}</p>
+              <p className="font-sans text-xs leading-relaxed text-zinc-300">
+                {safeText(confirmModalAction.description, 'No description provided.')}
               </p>
             </div>
-
-            <div className="flex items-center justify-between text-zinc-400 text-xs border-t border-zinc-800 pt-2">
+            <div className="flex items-center justify-between border-t border-zinc-800 pt-2 text-xs text-zinc-400">
               <span>Estimated Duration:</span>
-              <span className="text-white font-semibold">{confirmModalAction.estimatedDuration}</span>
+              <span className="font-semibold text-white">{safeText(confirmModalAction.estimatedDuration)}</span>
             </div>
           </div>
         </Modal>
@@ -273,3 +351,5 @@ export const RemediationPage: React.FC = () => {
     </div>
   );
 };
+
+export default RemediationPage;
