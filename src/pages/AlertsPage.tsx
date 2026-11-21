@@ -1,20 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
-  Flame,
-  CheckCircle2,
-  Clock,
-  Filter,
   Check,
-  Search,
-  ExternalLink,
   ShieldAlert,
-  ArrowRight,
-  Info,
 } from 'lucide-react';
-import { AlertItem, AlertSeverity, AlertStatus } from '../types';
+import { AlertItem } from '../types';
 import { api } from '../services/api';
-import { Card, CardHeader, CardTitle, CardDescription } from '../components/ui/Card';
+import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { StatusPill } from '../components/ui/StatusPill';
@@ -24,151 +16,240 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { TableSkeleton } from '../components/ui/LoadingSkeleton';
 import { useMonitoring } from '../context/MonitoringContext';
 
+type StatusFilter = 'all' | 'active' | 'acknowledged' | 'resolved';
+type SeverityFilter = 'all' | 'critical' | 'warning' | 'info';
+
+const isRecord = (value: unknown): value is Record<string, any> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const firstArray = (value: unknown, depth = 0): unknown[] | null => {
+  if (Array.isArray(value)) return value;
+  if (!isRecord(value) || depth > 3) return null;
+
+  // APIs commonly wrap lists in one or more of these properties.
+  for (const key of ['alerts', 'items', 'results', 'data', 'records']) {
+    const candidate = value[key];
+    if (Array.isArray(candidate)) return candidate;
+    const nested = firstArray(candidate, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+};
+
+const normalizeAlerts = (payload: unknown): AlertItem[] => {
+  const rows = firstArray(payload);
+  if (!rows) {
+    console.warn('APEX alerts API returned an unexpected response shape:', payload);
+    return [];
+  }
+
+  return rows
+    .filter(isRecord)
+    .map((row, index) => {
+      const severity = ['critical', 'warning', 'info'].includes(String(row.severity).toLowerCase())
+        ? String(row.severity).toLowerCase()
+        : 'info';
+      const status = ['active', 'acknowledged', 'resolved'].includes(String(row.status).toLowerCase())
+        ? String(row.status).toLowerCase()
+        : 'active';
+
+      return {
+        ...row,
+        id: String(row.id ?? row.alert_id ?? `alert-${index + 1}`),
+        title: String(row.title ?? row.name ?? row.message ?? 'Untitled alert'),
+        service: String(row.service ?? row.service_name ?? row.target ?? 'Unknown service'),
+        severity,
+        status,
+        currentValue: row.currentValue ?? row.current_value ?? row.value ?? '—',
+        threshold: row.threshold ?? row.threshold_rule ?? '—',
+        timestamp: String(row.timestamp ?? row.triggered_at ?? row.created_at ?? '—'),
+        recommendedAction: String(
+          row.recommendedAction ?? row.recommended_action ?? row.suggestion ?? 'Review the affected service and inspect recent telemetry.'
+        ),
+      } as AlertItem;
+    });
+};
+
+const normalizeUpdatedAlert = (payload: unknown, fallback: AlertItem): AlertItem => {
+  if (!isRecord(payload)) return fallback;
+  const candidate = isRecord(payload.alert) ? payload.alert : payload;
+  return {
+    ...fallback,
+    ...candidate,
+    id: String(candidate.id ?? candidate.alert_id ?? fallback.id),
+  } as AlertItem;
+};
+
 export const AlertsPage: React.FC = () => {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'acknowledged' | 'resolved'>('all');
-  const [severityFilter, setSeverityFilter] = useState<'all' | 'critical' | 'warning' | 'info'>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
   const [selectedAlert, setSelectedAlert] = useState<AlertItem | null>(null);
+  const [actionInProgress, setActionInProgress] = useState<string | null>(null);
   const { showNotification } = useMonitoring();
 
-  const fetchAlerts = async () => {
+  const fetchAlerts = useCallback(async () => {
     setLoading(true);
+    setLoadError('');
+
     try {
-      const data = await api.getAlerts({
+      const response = await api.getAlerts({
         status: statusFilter,
         severity: severityFilter,
       });
-      setAlerts(data);
-    } catch (e) {
-      console.error(e);
+      setAlerts(normalizeAlerts(response));
+    } catch (error) {
+      console.error('APEX failed to load alerts:', error);
+      setLoadError('Unable to load alerts from the server. Check the API connection and try again.');
+      setAlerts([]);
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    fetchAlerts();
   }, [statusFilter, severityFilter]);
 
-  const handleAcknowledge = async (alertItem: AlertItem, e?: React.MouseEvent) => {
-    e?.stopPropagation();
+  useEffect(() => {
+    void fetchAlerts();
+  }, [fetchAlerts]);
+
+  const updateAlertStatus = async (
+    alertItem: AlertItem,
+    status: 'acknowledged' | 'resolved'
+  ) => {
+    if (actionInProgress) return;
+    setActionInProgress(alertItem.id);
+
+    const updatePayload = status === 'acknowledged'
+      ? {
+          status,
+          acknowledgedBy: 'Current SRE User',
+          acknowledgedAt: new Date().toISOString(),
+        }
+      : {
+          status,
+          resolvedAt: new Date().toISOString(),
+        };
+
     try {
-      const updated = await api.updateAlert(alertItem.id, {
-        status: 'acknowledged',
-        acknowledgedBy: 'Current SRE User',
-        acknowledgedAt: new Date().toLocaleTimeString(),
-      });
-      setAlerts((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
-      if (selectedAlert?.id === updated.id) setSelectedAlert(updated);
-      showNotification(`Alert ${alertItem.id} acknowledged`, 'success');
-    } catch (err) {
-      showNotification('Failed to acknowledge alert', 'error');
+      const response = await api.updateAlert(alertItem.id, updatePayload);
+      const updated = normalizeUpdatedAlert(response, { ...alertItem, ...updatePayload } as AlertItem);
+
+      // Update locally even if the backend returns an empty response body.
+      setAlerts((previous) =>
+        previous.map((item) => item.id === alertItem.id ? updated : item)
+      );
+      setSelectedAlert((previous) =>
+        previous?.id === alertItem.id ? updated : previous
+      );
+      showNotification(
+        status === 'acknowledged'
+          ? `Alert ${alertItem.id} acknowledged`
+          : `Alert ${alertItem.id} marked as resolved`,
+        'success'
+      );
+    } catch (error) {
+      console.error(`APEX failed to ${status} alert:`, error);
+      showNotification(
+        status === 'acknowledged' ? 'Failed to acknowledge alert' : 'Failed to resolve alert',
+        'error'
+      );
+    } finally {
+      setActionInProgress(null);
     }
   };
 
-  const handleResolve = async (alertItem: AlertItem, e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    try {
-      const updated = await api.updateAlert(alertItem.id, {
-        status: 'resolved',
-        resolvedAt: new Date().toLocaleTimeString(),
-      });
-      setAlerts((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
-      if (selectedAlert?.id === updated.id) setSelectedAlert(updated);
-      showNotification(`Alert ${alertItem.id} marked as resolved`, 'success');
-    } catch (err) {
-      showNotification('Failed to resolve alert', 'error');
-    }
-  };
+  const filteredAlerts = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    return alerts.filter((alert) => {
+      const matchesSearch = !query ||
+        alert.title.toLowerCase().includes(query) ||
+        alert.service.toLowerCase().includes(query) ||
+        alert.id.toLowerCase().includes(query);
+      const matchesStatus = statusFilter === 'all' || alert.status === statusFilter;
+      const matchesSeverity = severityFilter === 'all' || alert.severity === severityFilter;
+      return matchesSearch && matchesStatus && matchesSeverity;
+    });
+  }, [alerts, searchTerm, statusFilter, severityFilter]);
 
-  const filteredAlerts = alerts.filter((a) => {
-    return (
-      a.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      a.service.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      a.id.toLowerCase().includes(searchTerm.toLowerCase())
-    );
-  });
+  const activeCount = alerts.filter((alert) => alert.status === 'active').length;
+  const criticalCount = alerts.filter((alert) => alert.severity === 'critical' && alert.status !== 'resolved').length;
+  const warningCount = alerts.filter((alert) => alert.severity === 'warning' && alert.status !== 'resolved').length;
+  const resolvedCount = alerts.filter((alert) => alert.status === 'resolved').length;
 
-  const activeCount = alerts.filter((a) => a.status === 'active').length;
-  const criticalCount = alerts.filter((a) => a.severity === 'critical' && a.status !== 'resolved').length;
-  const warningCount = alerts.filter((a) => a.severity === 'warning' && a.status !== 'resolved').length;
-  const resolvedCount = alerts.filter((a) => a.status === 'resolved').length;
+  const renderSeverity = (severity: string) => (
+    <Badge variant={severity === 'critical' ? 'critical' : severity === 'warning' ? 'warning' : 'default'}>
+      {severity.toUpperCase()}
+    </Badge>
+  );
 
   return (
     <div className="space-y-6">
-      {/* Top Counters Bar */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono">
           <span className="text-[10px] uppercase text-zinc-400 font-semibold">Active Alerts</span>
           <div className="text-2xl font-bold text-white mt-1">{activeCount}</div>
           <span className="text-[10px] text-zinc-500">Awaiting triage</span>
         </div>
-
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono">
           <span className="text-[10px] uppercase text-zinc-300 font-semibold">Critical Severity</span>
           <div className="text-2xl font-bold text-white mt-1">{criticalCount}</div>
           <span className="text-[10px] text-zinc-500">Immediate action required</span>
         </div>
-
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono">
           <span className="text-[10px] uppercase text-zinc-300 font-semibold">Warning Alerts</span>
           <div className="text-2xl font-bold text-white mt-1">{warningCount}</div>
           <span className="text-[10px] text-zinc-500">Threshold trending high</span>
         </div>
-
         <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 font-mono">
-          <span className="text-[10px] uppercase text-zinc-300 font-semibold">Resolved Today</span>
+          <span className="text-[10px] uppercase text-zinc-300 font-semibold">Resolved Alerts</span>
           <div className="text-2xl font-bold text-white mt-1">{resolvedCount}</div>
-          <span className="text-[10px] text-zinc-500">Auto &amp; manual remediations</span>
+          <span className="text-[10px] text-zinc-500">Resolved or remediated</span>
         </div>
       </div>
 
-      {/* Filter and Search Bar */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4">
         <SearchInput
           value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
+          onChange={(event) => setSearchTerm(event.target.value)}
           onClear={() => setSearchTerm('')}
           placeholder="Search alert title, ID, or service..."
           className="w-full sm:w-80"
         />
-
         <div className="flex items-center gap-2 flex-wrap font-mono text-xs">
-          {/* Status filter tabs */}
           <div className="flex items-center gap-1 bg-black p-1 rounded-lg border border-zinc-800">
-            {(['all', 'active', 'acknowledged', 'resolved'] as const).map((st) => (
+            {(['all', 'active', 'acknowledged', 'resolved'] as const).map((status) => (
               <button
-                key={st}
-                onClick={() => setStatusFilter(st)}
+                key={status}
+                onClick={() => setStatusFilter(status)}
                 className={`px-2.5 py-1 rounded capitalize transition-colors ${
-                  statusFilter === st ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-white'
+                  statusFilter === status ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-white'
                 }`}
               >
-                {st}
+                {status}
               </button>
             ))}
           </div>
-
-          {/* Severity filter tabs */}
           <div className="flex items-center gap-1 bg-black p-1 rounded-lg border border-zinc-800">
-            {(['all', 'critical', 'warning', 'info'] as const).map((sev) => (
+            {(['all', 'critical', 'warning', 'info'] as const).map((severity) => (
               <button
-                key={sev}
-                onClick={() => setSeverityFilter(sev)}
+                key={severity}
+                onClick={() => setSeverityFilter(severity)}
                 className={`px-2.5 py-1 rounded uppercase transition-colors ${
-                  severityFilter === sev ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-white'
+                  severityFilter === severity ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-white'
                 }`}
               >
-                {sev}
+                {severity}
               </button>
             ))}
           </div>
+          <Button variant="secondary" size="xs" onClick={() => void fetchAlerts()}>
+            Refresh
+          </Button>
         </div>
       </div>
 
-      {/* Alert List Table */}
       <Card noPadding>
         <div className="px-5 py-4 border-b border-zinc-800 flex items-center justify-between bg-black">
           <div className="flex items-center gap-2">
@@ -177,19 +258,20 @@ export const AlertsPage: React.FC = () => {
               Firing Alerts &amp; Threshold Violations ({filteredAlerts.length})
             </h3>
           </div>
-          <span className="text-[11px] font-mono text-zinc-400">
-            Click alert row for recommended remediation
-          </span>
+          <span className="text-[11px] font-mono text-zinc-400">Select an alert for diagnostics</span>
         </div>
 
         {loading ? (
-          <div className="p-4">
-            <TableSkeleton rows={5} />
+          <div className="p-4"><TableSkeleton rows={5} /></div>
+        ) : loadError ? (
+          <div className="p-6 text-center space-y-3">
+            <p className="text-sm text-red-300">{loadError}</p>
+            <Button variant="secondary" size="sm" onClick={() => void fetchAlerts()}>Retry</Button>
           </div>
         ) : filteredAlerts.length === 0 ? (
           <EmptyState
             title="No Alerts in Selected View"
-            description="All monitored thresholds are currently within nominal limits."
+            description="There are no alerts matching the current filters."
             actionLabel="Reset Filters"
             onAction={() => {
               setStatusFilter('all');
@@ -219,40 +301,24 @@ export const AlertsPage: React.FC = () => {
                     onClick={() => setSelectedAlert(alert)}
                     className="hover:bg-zinc-900/60 transition-colors cursor-pointer group"
                   >
+                    <td className="py-3 px-4">{renderSeverity(alert.severity)}</td>
                     <td className="py-3 px-4">
-                      <Badge variant={alert.severity === 'critical' ? 'critical' : alert.severity === 'warning' ? 'warning' : 'default'}>
-                        {alert.severity.toUpperCase()}
-                      </Badge>
-                    </td>
-
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-white transition-colors">
-                        {alert.title}
-                      </div>
+                      <div className="font-semibold text-white">{alert.title}</div>
                       <div className="text-[10px] text-zinc-500">{alert.id}</div>
                     </td>
-
                     <td className="py-3 px-4 text-zinc-300 font-medium">{alert.service}</td>
-
-                    <td className="py-3 px-4">
-                      <span className="font-bold text-white">{alert.currentValue}</span>
-                    </td>
-
-                    <td className="py-3 px-4 text-zinc-400">{alert.threshold}</td>
-
+                    <td className="py-3 px-4"><span className="font-bold text-white">{String(alert.currentValue)}</span></td>
+                    <td className="py-3 px-4 text-zinc-400">{String(alert.threshold)}</td>
                     <td className="py-3 px-4 text-zinc-400">{alert.timestamp}</td>
-
-                    <td className="py-3 px-4">
-                      <StatusPill status={alert.status} className="text-[10px]" />
-                    </td>
-
+                    <td className="py-3 px-4"><StatusPill status={alert.status} className="text-[10px]" /></td>
                     <td className="py-3 px-4 text-right">
-                      <div className="flex items-center justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center justify-end gap-1.5" onClick={(event) => event.stopPropagation()}>
                         {alert.status === 'active' && (
                           <Button
                             variant="secondary"
                             size="xs"
-                            onClick={(e) => handleAcknowledge(alert, e)}
+                            disabled={actionInProgress === alert.id}
+                            onClick={() => void updateAlertStatus(alert, 'acknowledged')}
                             className="text-[10px]"
                           >
                             ACK
@@ -262,7 +328,8 @@ export const AlertsPage: React.FC = () => {
                           <Button
                             variant="primary"
                             size="xs"
-                            onClick={(e) => handleResolve(alert, e)}
+                            disabled={actionInProgress === alert.id}
+                            onClick={() => void updateAlertStatus(alert, 'resolved')}
                             icon={<Check className="w-3 h-3" />}
                             className="text-[10px]"
                           >
@@ -279,7 +346,6 @@ export const AlertsPage: React.FC = () => {
         )}
       </Card>
 
-      {/* Alert Detail Modal with Recommended Actions */}
       {selectedAlert && (
         <Modal
           isOpen={!!selectedAlert}
@@ -289,15 +355,14 @@ export const AlertsPage: React.FC = () => {
           maxWidth="lg"
           footer={
             <div className="flex items-center justify-between w-full">
-              <span className="text-[11px] font-mono text-zinc-500">
-                Triggered: {selectedAlert.timestamp}
-              </span>
+              <span className="text-[11px] font-mono text-zinc-500">Triggered: {selectedAlert.timestamp}</span>
               <div className="flex items-center gap-2">
                 {selectedAlert.status === 'active' && (
                   <Button
                     variant="secondary"
                     size="sm"
-                    onClick={() => handleAcknowledge(selectedAlert)}
+                    disabled={actionInProgress === selectedAlert.id}
+                    onClick={() => void updateAlertStatus(selectedAlert, 'acknowledged')}
                   >
                     Acknowledge Alert
                   </Button>
@@ -306,61 +371,48 @@ export const AlertsPage: React.FC = () => {
                   <Button
                     variant="primary"
                     size="sm"
-                    onClick={() => handleResolve(selectedAlert)}
+                    disabled={actionInProgress === selectedAlert.id}
+                    onClick={() => void updateAlertStatus(selectedAlert, 'resolved')}
                   >
                     Mark Resolved
                   </Button>
                 )}
-                <Button variant="ghost" size="sm" onClick={() => setSelectedAlert(null)}>
-                  Close
-                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setSelectedAlert(null)}>Close</Button>
               </div>
             </div>
           }
         >
           <div className="space-y-4 font-mono text-xs">
-            {/* Severity & State */}
             <div className="grid grid-cols-2 gap-3 p-3 rounded-lg bg-black border border-zinc-800">
               <div>
                 <span className="text-zinc-500 text-[10px] uppercase">Alert Severity</span>
-                <div className="mt-1">
-                  <Badge variant={selectedAlert.severity === 'critical' ? 'critical' : 'warning'}>
-                    {selectedAlert.severity.toUpperCase()}
-                  </Badge>
-                </div>
+                <div className="mt-1">{renderSeverity(selectedAlert.severity)}</div>
               </div>
               <div>
                 <span className="text-zinc-500 text-[10px] uppercase">Current Lifecycle</span>
-                <div className="mt-1">
-                  <StatusPill status={selectedAlert.status} />
-                </div>
+                <div className="mt-1"><StatusPill status={selectedAlert.status} /></div>
               </div>
             </div>
-
-            {/* Metrics */}
             <div className="p-3.5 rounded-lg bg-zinc-950 border border-zinc-800 space-y-1">
               <span className="text-zinc-500 text-[10px] uppercase">Threshold Rule Violation</span>
               <p className="text-zinc-200">
-                Observed value <strong className="text-white font-bold">{selectedAlert.currentValue}</strong> exceeded rule{' '}
-                <strong className="text-zinc-300 font-mono">{selectedAlert.threshold}</strong>.
+                Observed value <strong className="text-white font-bold">{String(selectedAlert.currentValue)}</strong> against rule{' '}
+                <strong className="text-zinc-300 font-mono">{String(selectedAlert.threshold)}</strong>.
               </p>
             </div>
-
-            {/* AI Recommended Remediation Action */}
             <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-700 space-y-2">
               <div className="flex items-center gap-2 text-white font-bold uppercase text-[10px] tracking-wider">
                 <ShieldAlert className="w-4 h-4 text-white" />
-                AI Recommended Corrective Action
+                Recommended Corrective Action
               </div>
               <p className="text-zinc-200 text-xs leading-relaxed font-sans">
-                {selectedAlert.recommendedAction}
+                {selectedAlert.recommendedAction || 'Review the affected service and inspect recent telemetry.'}
               </p>
             </div>
-
             {selectedAlert.acknowledgedBy && (
               <div className="text-[11px] text-zinc-400 border-t border-zinc-800 pt-2">
-                Acknowledged by <strong className="text-white">{selectedAlert.acknowledgedBy}</strong> at{' '}
-                {selectedAlert.acknowledgedAt}
+                Acknowledged by <strong className="text-white">{selectedAlert.acknowledgedBy}</strong>
+                {selectedAlert.acknowledgedAt ? ` at ${selectedAlert.acknowledgedAt}` : ''}
               </div>
             )}
           </div>
@@ -369,3 +421,5 @@ export const AlertsPage: React.FC = () => {
     </div>
   );
 };
+
+export default AlertsPage;
