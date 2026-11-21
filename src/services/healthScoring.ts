@@ -1,30 +1,31 @@
+
 // APEX Product Health & Freshness Classification Engine
 // Evaluates telemetry against transparent operational thresholds.
-// Supports 4 Product Health States: EXCELLENT, GOOD, FAIR, POOR
-// Supports 3 Freshness States: FRESH, STALE, OFFLINE
+// Health: EXCELLENT, GOOD, FAIR, POOR
+// Freshness: FRESH, STALE, OFFLINE
 
 export type ProductHealthState = 'EXCELLENT' | 'GOOD' | 'FAIR' | 'POOR';
 export type FreshnessState = 'FRESH' | 'STALE' | 'OFFLINE';
 
 export interface HealthThresholdConfig {
-  cpuWarning: number; // default 75%
-  cpuCritical: number; // default 90%
-  memoryWarning: number; // default 80%
-  memoryCritical: number; // default 92%
-  diskWarning: number; // default 80%
-  diskCritical: number; // default 90%
-  latencyWarningMs: number; // default 150ms
-  latencyCriticalMs: number; // default 400ms
-  packetLossWarningPercent: number; // default 1.0%
-  packetLossCriticalPercent: number; // default 3.0%
-  staleThresholdSeconds: number; // default 10s
-  offlineThresholdSeconds: number; // default 60s
+  cpuWarning: number;
+  cpuCritical: number;
+  memoryWarning: number;
+  memoryCritical: number;
+  diskWarning: number;
+  diskCritical: number;
+  latencyWarningMs: number;
+  latencyCriticalMs: number;
+  packetLossWarningPercent: number;
+  packetLossCriticalPercent: number;
+  staleThresholdSeconds: number;
+  offlineThresholdSeconds: number;
 }
 
 export interface HealthEvaluationResult {
   state: ProductHealthState;
   freshness: FreshnessState;
-  score: number; // 0 - 100
+  score: number;
   latestEventTimestampUtc: string;
   lastSuccessfulUpdateUtc: string;
   secondsSinceLastUpdate: number;
@@ -51,15 +52,33 @@ export const DEFAULT_HEALTH_THRESHOLDS: HealthThresholdConfig = {
   diskCritical: 90,
   latencyWarningMs: 150,
   latencyCriticalMs: 400,
-  packetLossWarningPercent: 1.0,
-  packetLossCriticalPercent: 3.0,
+  packetLossWarningPercent: 1,
+  packetLossCriticalPercent: 3,
   staleThresholdSeconds: 10,
   offlineThresholdSeconds: 60,
 };
 
+type MetricStatus = 'nominal' | 'warning' | 'critical';
+
+const getStatus = (
+  value: number,
+  warning: number,
+  critical: number
+): MetricStatus => {
+  if (value >= critical) return 'critical';
+  if (value >= warning) return 'warning';
+  return 'nominal';
+};
+
+const safeNumber = (value: number | undefined, fallback: number): number =>
+  typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+
 export class HealthScoringEngine {
   private thresholds: HealthThresholdConfig = { ...DEFAULT_HEALTH_THRESHOLDS };
-  private lastSeenTimestampMs = Date.now();
+
+  // Zero means no telemetry has been received yet.
+  private lastSeenTimestampMs = 0;
+
   private lastEvaluatedResult: HealthEvaluationResult | null = null;
 
   public getThresholds(): HealthThresholdConfig {
@@ -71,7 +90,9 @@ export class HealthScoringEngine {
   }
 
   public setLastSeen(timestampMs: number): void {
-    this.lastSeenTimestampMs = timestampMs;
+    if (Number.isFinite(timestampMs) && timestampMs > 0) {
+      this.lastSeenTimestampMs = timestampMs;
+    }
   }
 
   public evaluateHealth(
@@ -86,41 +107,70 @@ export class HealthScoringEngine {
     },
     nowMs: number = Date.now()
   ): HealthEvaluationResult {
-    const cpu = metrics.cpu ?? 52.4;
-    const memory = metrics.memory ?? 68.1;
-    const disk = metrics.disk ?? 58.0;
-    const latency = metrics.latency ?? 42.0;
-    const packetLoss = metrics.packetLoss ?? 0.05;
-    const failedLogins = metrics.failedLogins ?? 0;
+    const now = Number.isFinite(nowMs) ? nowMs : Date.now();
 
-    let eventTimeMs = nowMs;
-    if (metrics.timestamp) {
-      eventTimeMs = typeof metrics.timestamp === 'number' ? metrics.timestamp : new Date(metrics.timestamp).getTime();
-      this.lastSeenTimestampMs = Math.max(this.lastSeenTimestampMs, eventTimeMs);
+    const cpu = safeNumber(metrics.cpu, 52.4);
+    const memory = safeNumber(metrics.memory, 68.1);
+    const disk = safeNumber(metrics.disk, 58);
+    const latency = safeNumber(metrics.latency, 42);
+    const packetLoss = safeNumber(metrics.packetLoss, 0.05);
+    const failedLogins = safeNumber(metrics.failedLogins, 0);
+
+    // Parse the incoming event timestamp safely.
+    let eventTimeMs = now;
+
+    if (metrics.timestamp !== undefined && metrics.timestamp !== null) {
+      const parsed =
+        typeof metrics.timestamp === 'number'
+          ? metrics.timestamp
+          : new Date(metrics.timestamp).getTime();
+
+      if (Number.isFinite(parsed) && parsed > 0) {
+        eventTimeMs = parsed;
+
+        // Only advance last-seen time for newer valid events.
+        if (
+          this.lastSeenTimestampMs === 0 ||
+          parsed > this.lastSeenTimestampMs
+        ) {
+          this.lastSeenTimestampMs = parsed;
+        }
+      }
+    } else if (this.lastSeenTimestampMs === 0) {
+      // First evaluation without an explicit timestamp.
+      this.lastSeenTimestampMs = now;
     }
 
-    const secondsSinceLastUpdate = Math.max(0, Math.floor((nowMs - this.lastSeenTimestampMs) / 1000));
+    const secondsSinceLastUpdate =
+      this.lastSeenTimestampMs > 0
+        ? Math.max(
+            0,
+            Math.floor((now - this.lastSeenTimestampMs) / 1000)
+          )
+        : Math.max(0, Math.floor(now / 1000));
 
-    // Freshness evaluation
+    // Freshness classification.
     let freshness: FreshnessState = 'FRESH';
+
     if (secondsSinceLastUpdate > this.thresholds.offlineThresholdSeconds) {
       freshness = 'OFFLINE';
     } else if (secondsSinceLastUpdate > this.thresholds.staleThresholdSeconds) {
       freshness = 'STALE';
     }
 
-    // Metric Status Checks
-    const cpuStatus = cpu >= this.thresholds.cpuCritical ? 'critical' : cpu >= this.thresholds.cpuWarning ? 'warning' : 'nominal';
-    const memStatus = memory >= this.thresholds.memoryCritical ? 'critical' : memory >= this.thresholds.memoryWarning ? 'warning' : 'nominal';
-    const diskStatus = disk >= this.thresholds.diskCritical ? 'critical' : disk >= this.thresholds.diskWarning ? 'warning' : 'nominal';
-    const latStatus = latency >= this.thresholds.latencyCriticalMs ? 'critical' : latency >= this.thresholds.latencyWarningMs ? 'warning' : 'nominal';
-    const plStatus = packetLoss >= this.thresholds.packetLossCriticalPercent ? 'critical' : packetLoss >= this.thresholds.packetLossWarningPercent ? 'warning' : 'nominal';
-    const flStatus = failedLogins >= 25 ? 'critical' : failedLogins >= 5 ? 'warning' : 'nominal';
+    // Metric status classification.
+    const cpuStatus = getStatus(cpu, this.thresholds.cpuWarning, this.thresholds.cpuCritical);
+    const memStatus = getStatus(memory, this.thresholds.memoryWarning, this.thresholds.memoryCritical);
+    const diskStatus = getStatus(disk, this.thresholds.diskWarning, this.thresholds.diskCritical);
+    const latStatus = getStatus(latency, this.thresholds.latencyWarningMs, this.thresholds.latencyCriticalMs);
+    const plStatus = getStatus(packetLoss, this.thresholds.packetLossWarningPercent, this.thresholds.packetLossCriticalPercent);
+    const flStatus = getStatus(failedLogins, 5, 25);
 
-    const criticalCount = [cpuStatus, memStatus, diskStatus, latStatus, plStatus, flStatus].filter((s) => s === 'critical').length;
-    const warningCount = [cpuStatus, memStatus, diskStatus, latStatus, plStatus, flStatus].filter((s) => s === 'warning').length;
+    const statuses = [cpuStatus, memStatus, diskStatus, latStatus, plStatus, flStatus];
 
-    // Four Product Health States Assignment
+    const criticalCount = statuses.filter(s => s === 'critical').length;
+    const warningCount = statuses.filter(s => s === 'warning').length;
+
     let state: ProductHealthState = 'EXCELLENT';
     let triggeringMetric = 'System Fleet';
     let triggeringValue = 'Nominal';
@@ -133,62 +183,78 @@ export class HealthScoringEngine {
       triggeringValue = `${secondsSinceLastUpdate}s elapsed`;
       triggeringThreshold = `>${this.thresholds.offlineThresholdSeconds}s`;
       reason = `Collector heartbeat lost for ${secondsSinceLastUpdate}s. Node marked OFFLINE.`;
-    } else if (criticalCount >= 1 || (cpuStatus === 'critical' && latStatus === 'critical')) {
+    } else if (criticalCount > 0) {
       state = 'POOR';
+
       if (cpuStatus === 'critical') {
         triggeringMetric = 'CPU Utilization';
         triggeringValue = `${cpu.toFixed(1)}%`;
-        triggeringThreshold = `>${this.thresholds.cpuCritical}%`;
-        reason = `Critical CPU saturation (${cpu.toFixed(1)}%) exceeding threshold (${this.thresholds.cpuCritical}%).`;
+        triggeringThreshold = `>=${this.thresholds.cpuCritical}%`;
+        reason = `Critical CPU saturation (${cpu.toFixed(1)}%) detected.`;
       } else if (latStatus === 'critical') {
         triggeringMetric = 'P95 Latency';
         triggeringValue = `${latency.toFixed(1)}ms`;
-        triggeringThreshold = `>${this.thresholds.latencyCriticalMs}ms`;
-        reason = `Severe latency degradation (${latency.toFixed(1)}ms) crossing critical threshold.`;
+        triggeringThreshold = `>=${this.thresholds.latencyCriticalMs}ms`;
+        reason = `Severe latency degradation (${latency.toFixed(1)}ms) detected.`;
       } else if (memStatus === 'critical') {
         triggeringMetric = 'Memory Utilization';
         triggeringValue = `${memory.toFixed(1)}%`;
-        triggeringThreshold = `>${this.thresholds.memoryCritical}%`;
-        reason = `OOM Risk: Memory capacity saturated at ${memory.toFixed(1)}%.`;
-      } else {
+        triggeringThreshold = `>=${this.thresholds.memoryCritical}%`;
+        reason = `Critical memory utilization (${memory.toFixed(1)}%) detected.`;
+      } else if (diskStatus === 'critical') {
+        triggeringMetric = 'Disk Utilization';
+        triggeringValue = `${disk.toFixed(1)}%`;
+        triggeringThreshold = `>=${this.thresholds.diskCritical}%`;
+        reason = 'Critical disk utilization detected.';
+      } else if (plStatus === 'critical') {
         triggeringMetric = 'Packet Loss';
         triggeringValue = `${packetLoss.toFixed(2)}%`;
-        triggeringThreshold = `>${this.thresholds.packetLossCriticalPercent}%`;
-        reason = `High packet loss (${packetLoss.toFixed(2)}%) causing transmission aborts.`;
+        triggeringThreshold = `>=${this.thresholds.packetLossCriticalPercent}%`;
+        reason = 'Critical packet loss detected.';
+      } else {
+        triggeringMetric = 'Failed Logins';
+        triggeringValue = String(failedLogins);
+        triggeringThreshold = '>=25';
+        reason = 'Critical number of failed login attempts detected.';
       }
-    } else if (warningCount >= 2 || plStatus === 'warning' || latStatus === 'warning') {
+    } else if (warningCount >= 2 || latStatus === 'warning' || plStatus === 'warning') {
       state = 'FAIR';
       triggeringMetric = latStatus === 'warning' ? 'P95 Latency' : 'Resource Utilization';
-      triggeringValue = latStatus === 'warning' ? `${latency.toFixed(1)}ms` : `${warningCount} warnings active`;
-      triggeringThreshold = `>${this.thresholds.latencyWarningMs}ms / 2 warnings`;
-      reason = 'Persistent degradation detected across multiple telemetry vectors.';
+      triggeringValue = latStatus === 'warning'
+        ? `${latency.toFixed(1)}ms`
+        : `${warningCount} warnings active`;
+      triggeringThreshold = 'Warning thresholds exceeded';
+      reason = 'Degradation detected across multiple telemetry indicators.';
     } else if (warningCount === 1) {
       state = 'GOOD';
+
       if (cpuStatus === 'warning') {
         triggeringMetric = 'CPU Utilization';
         triggeringValue = `${cpu.toFixed(1)}%`;
-        triggeringThreshold = `>${this.thresholds.cpuWarning}%`;
-        reason = `Minor CPU deviation (${cpu.toFixed(1)}%) observed, fleet remains functional.`;
+        triggeringThreshold = `>=${this.thresholds.cpuWarning}%`;
+        reason = 'Minor CPU utilization elevation detected.';
       } else {
         triggeringMetric = 'Resource Warning';
         triggeringValue = '1 Signal Elevated';
         triggeringThreshold = 'Warning Band';
-        reason = 'Isolated minor metric elevation; automatic baseline tracking active.';
+        reason = 'An isolated metric elevation has been detected.';
       }
     }
 
-    // Score computation
     let score = 100;
+
     if (state === 'GOOD') score = 84;
-    else if (state === 'FAIR') score = 65;
-    else if (state === 'POOR') score = 38;
+    if (state === 'FAIR') score = 65;
+    if (state === 'POOR') score = 38;
 
     const result: HealthEvaluationResult = {
       state,
       freshness,
       score,
       latestEventTimestampUtc: new Date(eventTimeMs).toISOString(),
-      lastSuccessfulUpdateUtc: new Date(this.lastSeenTimestampMs).toISOString(),
+      lastSuccessfulUpdateUtc: new Date(
+        this.lastSeenTimestampMs || now
+      ).toISOString(),
       secondsSinceLastUpdate,
       triggeringMetric,
       triggeringValue,
