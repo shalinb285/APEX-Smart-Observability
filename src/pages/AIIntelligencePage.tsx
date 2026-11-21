@@ -2,14 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Cpu,
-  Sparkles,
   AlertTriangle,
   TrendingUp,
   GitBranch,
-  ShieldAlert,
-  ArrowRight,
   CheckCircle2,
-  Clock,
   Layers,
   Activity,
   Zap,
@@ -20,7 +16,6 @@ import {
   AnomalyItem,
   PredictionForecast,
   RootCauseAnalysis,
-  AIRecommendation,
 } from '../types';
 import { api } from '../services/api';
 import { Card, CardHeader, CardTitle, CardDescription } from '../components/ui/Card';
@@ -28,7 +23,6 @@ import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { StatusPill } from '../components/ui/StatusPill';
 import { Tabs } from '../components/ui/Tabs';
-import { Modal } from '../components/ui/Modal';
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -41,6 +35,28 @@ import {
   Legend,
 } from 'recharts';
 
+// API responses can be empty, wrapped, or temporarily unavailable.
+// Normalize them before rendering so a missing field never crashes the page.
+const toSafeArray = <T,>(value: unknown): T[] => {
+  if (Array.isArray(value)) return value as T[];
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    for (const key of ['items', 'results', 'data']) {
+      if (Array.isArray(record[key])) return record[key] as T[];
+    }
+  }
+  return [];
+};
+
+const toSafeObject = <T,>(value: unknown): T | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const candidate = record.data ?? record.result ?? value;
+  return candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    ? candidate as T
+    : null;
+};
+
 export const AIIntelligencePage: React.FC = () => {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<'anomalies' | 'predictions' | 'rca' | 'recommendations'>('rca');
@@ -48,37 +64,91 @@ export const AIIntelligencePage: React.FC = () => {
   const [predictions, setPredictions] = useState<PredictionForecast[]>([]);
   const [rca, setRca] = useState<RootCauseAnalysis | null>(null);
   const [selectedPrediction, setSelectedPrediction] = useState<PredictionForecast | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
+    let cancelled = false;
+
     const loadAIData = async () => {
-      try {
-        const [anomData, predData, rcaData] = await Promise.all([
-          api.getAnomalies(),
-          api.getPredictions(),
-          api.getRootCause(),
-        ]);
-        setAnomalies(anomData);
-        setPredictions(predData);
-        setRca(rcaData);
-        if (predData.length > 0) {
-          setSelectedPrediction(predData[0]);
-        }
-      } catch (e) {
-        console.error(e);
+      setLoading(true);
+      setLoadError('');
+
+      const [anomalyResult, predictionResult, rcaResult] = await Promise.allSettled([
+        api.getAnomalies(),
+        api.getPredictions(),
+        api.getRootCause(),
+      ]);
+
+      if (cancelled) return;
+
+      if (anomalyResult.status === 'fulfilled') {
+        setAnomalies(toSafeArray<AnomalyItem>(anomalyResult.value));
+      } else {
+        setAnomalies([]);
+        console.error('Failed to load anomalies:', anomalyResult.reason);
       }
+
+      if (predictionResult.status === 'fulfilled') {
+        const safePredictions = toSafeArray<PredictionForecast>(predictionResult.value);
+        setPredictions(safePredictions);
+        setSelectedPrediction((current) =>
+          current && safePredictions.some((item) => item?.id === current.id)
+            ? current
+            : safePredictions[0] ?? null
+        );
+      } else {
+        setPredictions([]);
+        setSelectedPrediction(null);
+        console.error('Failed to load predictions:', predictionResult.reason);
+      }
+
+      if (rcaResult.status === 'fulfilled') {
+        setRca(toSafeObject<RootCauseAnalysis>(rcaResult.value));
+      } else {
+        setRca(null);
+        console.error('Failed to load root cause analysis:', rcaResult.reason);
+      }
+
+      const allFailed = [anomalyResult, predictionResult, rcaResult]
+        .every((result) => result.status === 'rejected');
+      if (allFailed) setLoadError('AI data is temporarily unavailable. Check the backend connection and try again.');
+
+      setLoading(false);
     };
-    loadAIData();
+
+    void loadAIData();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const affectedServices = Array.isArray(rca?.affectedServices) ? rca.affectedServices : [];
+  const relatedMetrics = Array.isArray(rca?.relatedMetrics) ? rca.relatedMetrics : [];
+  const evidence = Array.isArray(rca?.evidence) ? rca.evidence : [];
+  const anomalyCount = anomalies.length;
+  const predictionCount = predictions.length;
 
   const tabs = [
     { id: 'rca', label: 'Root Cause Analysis', icon: <GitBranch className="w-3.5 h-3.5 text-white" /> },
-    { id: 'anomalies', label: 'Anomaly Detection', count: anomalies.length, icon: <AlertTriangle className="w-3.5 h-3.5 text-zinc-300" /> },
-    { id: 'predictions', label: 'Predictive Forecasting', count: predictions.length, icon: <TrendingUp className="w-3.5 h-3.5 text-white" /> },
+    { id: 'anomalies', label: 'Anomaly Detection', count: anomalyCount, icon: <AlertTriangle className="w-3.5 h-3.5 text-zinc-300" /> },
+    { id: 'predictions', label: 'Predictive Forecasting', count: predictionCount, icon: <TrendingUp className="w-3.5 h-3.5 text-white" /> },
     { id: 'recommendations', label: 'AI Remediation Plan', count: 4, icon: <Zap className="w-3.5 h-3.5 text-zinc-300" /> },
   ];
 
   return (
     <div className="space-y-6">
+      {loadError && (
+        <div role="alert" className="rounded-xl border border-amber-700/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-200">
+          {loadError}
+        </div>
+      )}
+      {loading && (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-xs font-mono text-zinc-400" aria-live="polite">
+          Loading AI intelligence data…
+        </div>
+      )}
       {/* AI Hero Banner */}
       <Card variant="gradient" className="border-zinc-800 relative overflow-hidden">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
@@ -124,13 +194,13 @@ export const AIIntelligencePage: React.FC = () => {
               <div>
                 <CardTitle className="text-white">
                   <GitBranch className="w-4 h-4 text-white" />
-                  Correlated Incident Root Cause Analysis // {rca.id}
+                  Correlated Incident Root Cause Analysis // {rca.id ?? 'N/A'}
                 </CardTitle>
-                <CardDescription>Generated at {rca.timestamp} based on cross-cluster telemetry vectors</CardDescription>
+                <CardDescription>Generated at {rca.timestamp ?? 'Timestamp unavailable'} based on cross-cluster telemetry vectors</CardDescription>
               </div>
               <div className="flex items-center gap-2">
                 <Badge variant="critical">
-                  CONFIDENCE: {rca.confidenceScore}%
+                  CONFIDENCE: {rca.confidenceScore ?? 0}%
                 </Badge>
               </div>
             </CardHeader>
@@ -141,9 +211,9 @@ export const AIIntelligencePage: React.FC = () => {
                 <span className="text-[10px] uppercase font-mono tracking-wider text-white font-bold">
                   Primary Issue Detected
                 </span>
-                <h4 className="text-base font-bold font-mono text-white">{rca.issue}</h4>
+                <h4 className="text-base font-bold font-mono text-white">{rca.issue ?? 'No primary issue reported'}</h4>
                 <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed font-sans">
-                  {rca.suspectedRootCause}
+                  {rca.suspectedRootCause ?? 'No root cause details available.'}
                 </p>
               </div>
 
@@ -153,10 +223,10 @@ export const AIIntelligencePage: React.FC = () => {
                 <div className="p-4 rounded-xl bg-black border border-zinc-800 space-y-2.5">
                   <span className="text-[10px] uppercase tracking-wider text-zinc-400 font-semibold flex items-center gap-1.5">
                     <Layers className="w-3.5 h-3.5 text-white" />
-                    Impacted Dependency Chain ({rca.affectedServices.length} Services)
+                    Impacted Dependency Chain ({affectedServices.length} Services)
                   </span>
                   <div className="flex flex-wrap gap-2 pt-1">
-                    {rca.affectedServices.map((svc) => (
+                    {affectedServices.map((svc) => (
                       <span
                         key={svc}
                         className="px-2.5 py-1 rounded-lg bg-zinc-900 border border-zinc-700 text-white text-xs font-semibold"
@@ -174,7 +244,7 @@ export const AIIntelligencePage: React.FC = () => {
                     Correlated Anomaly Metrics
                   </span>
                   <div className="space-y-1.5 pt-1">
-                    {rca.relatedMetrics.map((met, i) => (
+                    {relatedMetrics.map((met, i) => (
                       <div key={i} className="flex items-center gap-2 text-zinc-300">
                         <span className="w-1.5 h-1.5 rounded-full bg-white" />
                         <span>{met}</span>
@@ -190,7 +260,7 @@ export const AIIntelligencePage: React.FC = () => {
                   Autonomous Corroborating Evidence
                 </span>
                 <div className="space-y-2">
-                  {rca.evidence.map((ev, i) => (
+                  {evidence.map((ev, i) => (
                     <div key={i} className="flex items-start gap-2.5 text-xs text-zinc-300 font-mono">
                       <CheckCircle2 className="w-4 h-4 text-white shrink-0 mt-0.5" />
                       <span>{ev}</span>
@@ -206,7 +276,7 @@ export const AIIntelligencePage: React.FC = () => {
                     Suggested Automated Remediation
                   </span>
                   <p className="text-xs sm:text-sm font-mono text-white font-medium">
-                    {rca.recommendedRemediation}
+                    {rca.recommendedRemediation ?? 'No remediation recommendation available.'}
                   </p>
                 </div>
                 <Button
@@ -344,7 +414,7 @@ export const AIIntelligencePage: React.FC = () => {
 
               <div style={{ width: '100%', height: 280 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart data={selectedPrediction.dataPoints} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <ComposedChart data={Array.isArray(selectedPrediction.dataPoints) ? selectedPrediction.dataPoints : []} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#27272A" vertical={false} />
                     <XAxis
                       dataKey="timestamp"
@@ -361,7 +431,7 @@ export const AIIntelligencePage: React.FC = () => {
                     />
                     <Tooltip
                       content={({ active, payload, label }: any) => {
-                        if (active && payload && payload.length) {
+                        if (active && Array.isArray(payload) && payload.length) {
                           return (
                             <div className="bg-black border border-zinc-700 p-3 rounded-xl text-xs font-mono shadow-xl">
                               <p className="text-zinc-400 mb-1 border-b border-zinc-800 pb-1">{label}</p>
