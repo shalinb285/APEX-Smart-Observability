@@ -1,20 +1,13 @@
+
 import React, { useState, useEffect } from 'react';
 import {
   Terminal,
-  Search,
-  Filter,
-  AlertTriangle,
-  Flame,
-  Info,
-  CheckCircle2,
+  Copy,
+  Download,
   ChevronRight,
   ChevronDown,
-  Copy,
-  ExternalLink,
-  Download,
-  Calendar,
-  Layers,
 } from 'lucide-react';
+
 import { LogEntry, LogSeverity } from '../types';
 import { api } from '../services/api';
 import { Card } from '../components/ui/Card';
@@ -24,42 +17,169 @@ import { SearchInput } from '../components/ui/SearchInput';
 import { TableSkeleton } from '../components/ui/LoadingSkeleton';
 import { EmptyState } from '../components/ui/EmptyState';
 
+type UnknownRecord = Record<string, unknown>;
+
+const isRecord = (value: unknown): value is UnknownRecord =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const toText = (value: unknown, fallback = ''): string => {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return fallback;
+};
+
+// Accept arrays and common API response wrappers.
+// Never allow an unexpected object to reach Array.map().
+const extractLogArray = (value: unknown): unknown[] => {
+  if (Array.isArray(value)) return value;
+
+  if (!isRecord(value)) return [];
+
+  const possibleKeys = ['logs', 'items', 'results', 'events', 'data'];
+
+  for (const key of possibleKeys) {
+    const nested = value[key];
+
+    if (Array.isArray(nested)) return nested;
+
+    if (isRecord(nested)) {
+      const result = extractLogArray(nested);
+      if (result.length > 0) return result;
+    }
+  }
+
+  return [];
+};
+
+const normalizeLogs = (value: unknown): LogEntry[] => {
+  return extractLogArray(value)
+    .filter(isRecord)
+    .map((item, index) => {
+      const rawSeverity = toText(
+        item.severity ?? item.level ?? item.log_level,
+        'INFO'
+      ).toUpperCase();
+
+      const severity: LogSeverity =
+        rawSeverity === 'CRITICAL' ||
+        rawSeverity === 'ERROR' ||
+        rawSeverity === 'WARNING' ||
+        rawSeverity === 'INFO'
+          ? rawSeverity
+          : 'INFO';
+
+      const rawTimestamp =
+        item.timestamp ?? item.created_at ?? item.time;
+
+      const timestamp = toText(
+        rawTimestamp,
+        new Date().toISOString()
+      );
+
+      const rawPayload = item.payload ?? item.context ?? item.metadata;
+
+      return {
+        id: toText(item.id ?? item.log_id, `log-${index}`),
+        timestamp,
+        severity,
+        service: toText(
+          item.service ?? item.service_name ?? item.application,
+          'unknown-service'
+        ),
+        message: toText(
+          item.message ?? item.msg ?? item.description,
+          'No log message provided'
+        ),
+        host: toText(item.host ?? item.hostname, 'unknown'),
+        environment: toText(
+          item.environment ?? item.env,
+          'unknown'
+        ),
+        traceId: toText(
+          item.traceId ?? item.trace_id ?? item.traceID,
+          ''
+        ),
+        stackTrace: toText(
+          item.stackTrace ?? item.stack_trace,
+          ''
+        ),
+        payload: isRecord(rawPayload) ? rawPayload : undefined,
+      } as LogEntry;
+    });
+};
+
 export const LogsPage: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedService, setSelectedService] = useState('all');
   const [selectedSeverity, setSelectedSeverity] = useState('all');
-  const [expandedLogId, setExpandedLogId] = useState<string | null>('log-001');
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const fetchLogs = async () => {
       setLoading(true);
+      setError('');
+
       try {
-        const data = await api.getLogs({
+        const response: unknown = await api.getLogs({
           service: selectedService,
           severity: selectedSeverity,
           search: searchTerm,
         });
-        setLogs(data);
-      } catch (e) {
-        console.error(e);
+
+        const safeLogs = normalizeLogs(response);
+
+        if (!cancelled) {
+          setLogs(safeLogs);
+          setExpandedLogId(current =>
+            current && safeLogs.some(log => log.id === current)
+              ? current
+              : safeLogs[0]?.id ?? null
+          );
+        }
+      } catch (err) {
+        console.error('APEX Logs loading failed:', err);
+
+        if (!cancelled) {
+          setLogs([]);
+          setError(
+            'Unable to load logs from the backend. Please check the API connection.'
+          );
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
+
     fetchLogs();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedService, selectedSeverity, searchTerm]);
 
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+  const copyToClipboard = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      window.setTimeout(() => setCopiedId(null), 2000);
+    } catch (err) {
+      console.error('Unable to copy log:', err);
+      setError('Clipboard access failed. Please copy the log manually.');
+    }
   };
 
-  const getSeverityBadge = (sev: LogSeverity) => {
-    switch (sev) {
+  const getSeverityBadge = (severity: LogSeverity) => {
+    switch (severity) {
       case 'CRITICAL':
         return <Badge variant="critical">CRITICAL</Badge>;
       case 'ERROR':
@@ -69,12 +189,12 @@ export const LogsPage: React.FC = () => {
       case 'INFO':
         return <Badge variant="outline">INFO</Badge>;
       default:
-        return <Badge>{sev}</Badge>;
+        return <Badge>{severity}</Badge>;
     }
   };
 
-  const getRowHighlight = (sev: LogSeverity) => {
-    switch (sev) {
+  const getRowHighlight = (severity: LogSeverity) => {
+    switch (severity) {
       case 'CRITICAL':
         return 'bg-zinc-900/60 border-l-2 border-l-white';
       case 'ERROR':
@@ -86,16 +206,40 @@ export const LogsPage: React.FC = () => {
     }
   };
 
-  const services = ['all', 'payment-gateway', 'order-service', 'auth-service', 'api-gateway', 'redis-cache', 'spark-worker-bigdata-01'];
+  const services = [
+    'all',
+    'payment-gateway',
+    'order-service',
+    'auth-service',
+    'api-gateway',
+    'redis-cache',
+    'spark-worker-bigdata-01',
+  ];
+
+  const exportLogs = () => {
+    const content = JSON.stringify(logs, null, 2);
+    const blob = new Blob([content], {
+      type: 'application/json',
+    });
+
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+
+    anchor.href = url;
+    anchor.download = `apex-logs-${Date.now()}.json`;
+    anchor.click();
+
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="space-y-6">
-      {/* Top Filter Controls */}
+      {/* Filters */}
       <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-4">
         <div className="flex items-center gap-3 flex-1 max-w-xl">
           <SearchInput
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={event => setSearchTerm(event.target.value)}
             onClear={() => setSearchTerm('')}
             placeholder="Search log messages, trace IDs, stack trace keywords..."
             className="w-full"
@@ -103,52 +247,46 @@ export const LogsPage: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Service Dropdown */}
           <div className="flex items-center gap-1.5 bg-black border border-zinc-800 px-2.5 py-1 rounded-lg text-xs font-mono">
             <span className="text-zinc-500">SVC:</span>
+
             <select
               value={selectedService}
-              onChange={(e) => setSelectedService(e.target.value)}
+              onChange={event => setSelectedService(event.target.value)}
               className="bg-transparent text-zinc-200 focus:outline-none cursor-pointer"
             >
-              {services.map((s) => (
-                <option key={s} value={s} className="bg-black text-zinc-200">
-                  {s.toUpperCase()}
+              {services.map(service => (
+                <option
+                  key={service}
+                  value={service}
+                  className="bg-black text-zinc-200"
+                >
+                  {service.toUpperCase()}
                 </option>
               ))}
             </select>
           </div>
 
-          {/* Severity Badges */}
           <div className="flex items-center gap-1 bg-black p-1 rounded-lg border border-zinc-800 text-xs font-mono">
-            {(['all', 'CRITICAL', 'ERROR', 'WARNING', 'INFO'] as const).map((lvl) => (
+            {(['all', 'CRITICAL', 'ERROR', 'WARNING', 'INFO'] as const).map(level => (
               <button
-                key={lvl}
-                onClick={() => setSelectedSeverity(lvl)}
+                key={level}
+                onClick={() => setSelectedSeverity(level)}
                 className={`px-2.5 py-1 rounded-md transition-colors ${
-                  selectedSeverity === lvl
+                  selectedSeverity === level
                     ? 'bg-zinc-800 text-white font-semibold'
                     : 'text-zinc-400 hover:text-white'
                 }`}
               >
-                {lvl}
+                {level}
               </button>
             ))}
           </div>
 
-          {/* Download Logs Button */}
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => {
-              const text = JSON.stringify(logs, null, 2);
-              const blob = new Blob([text], { type: 'application/json' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `logs-export-${Date.now()}.json`;
-              a.click();
-            }}
+            onClick={exportLogs}
             icon={<Download className="w-3.5 h-3.5" />}
             className="text-xs font-mono"
           >
@@ -157,7 +295,7 @@ export const LogsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Main Logs Table and Viewer */}
+      {/* Logs Table */}
       <Card noPadding className="overflow-hidden">
         <div className="px-5 py-3.5 border-b border-zinc-800 flex items-center justify-between bg-black">
           <div className="flex items-center gap-2">
@@ -166,6 +304,7 @@ export const LogsPage: React.FC = () => {
               Live Log Stream ({logs.length} events buffered)
             </span>
           </div>
+
           <span className="text-[11px] font-mono text-zinc-400">
             Click row to toggle JSON payload &amp; stack trace
           </span>
@@ -175,10 +314,24 @@ export const LogsPage: React.FC = () => {
           <div className="p-4">
             <TableSkeleton rows={8} />
           </div>
+        ) : error ? (
+          <div className="p-6 text-sm text-red-300 font-mono">
+            <p>{error}</p>
+            <button
+              onClick={() => {
+                setSearchTerm('');
+                setSelectedService('all');
+                setSelectedSeverity('all');
+              }}
+              className="mt-3 underline text-zinc-200"
+            >
+              Reset filters
+            </button>
+          </div>
         ) : logs.length === 0 ? (
           <EmptyState
             title="No Logs Matched Filter"
-            description="Try loosening your search query or selecting 'ALL' severity."
+            description="Try loosening your search query or selecting ALL severity."
             actionLabel="Reset Search"
             onAction={() => {
               setSearchTerm('');
@@ -188,16 +341,26 @@ export const LogsPage: React.FC = () => {
           />
         ) : (
           <div className="divide-y divide-zinc-800/80 font-mono text-xs">
-            {logs.map((log) => {
+            {logs.map(log => {
               const isExpanded = expandedLogId === log.id;
+
               return (
-                <div key={log.id} className={`transition-colors ${getRowHighlight(log.severity)}`}>
-                  {/* Log Summary Row */}
+                <div
+                  key={log.id}
+                  className={`transition-colors ${getRowHighlight(log.severity)}`}
+                >
+                  {/* Summary Row */}
                   <div
-                    onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
+                    onClick={() =>
+                      setExpandedLogId(isExpanded ? null : log.id)
+                    }
                     className="flex items-start gap-3 px-4 py-3 hover:bg-zinc-900/60 cursor-pointer select-none"
                   >
-                    <button className="text-zinc-500 hover:text-white mt-0.5">
+                    <button
+                      type="button"
+                      aria-label={isExpanded ? 'Collapse log' : 'Expand log'}
+                      className="text-zinc-500 hover:text-white mt-0.5"
+                    >
                       {isExpanded ? (
                         <ChevronDown className="w-4 h-4" />
                       ) : (
@@ -205,23 +368,22 @@ export const LogsPage: React.FC = () => {
                       )}
                     </button>
 
-                    {/* Timestamp */}
                     <span className="text-zinc-400 text-[11px] shrink-0 mt-0.5">
                       {log.timestamp}
                     </span>
 
-                    {/* Severity */}
-                    <div className="shrink-0">{getSeverityBadge(log.severity)}</div>
+                    <div className="shrink-0">
+                      {getSeverityBadge(log.severity)}
+                    </div>
 
-                    {/* Service */}
                     <span className="text-zinc-300 font-semibold shrink-0 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-700 text-[11px]">
                       {log.service}
                     </span>
 
-                    {/* Message Preview */}
-                    <p className="text-zinc-200 flex-1 truncate">{log.message}</p>
+                    <p className="text-zinc-200 flex-1 truncate">
+                      {log.message}
+                    </p>
 
-                    {/* Trace ID indicator */}
                     {log.traceId && (
                       <span className="hidden md:inline-block text-[10px] text-zinc-300 bg-zinc-900 border border-zinc-700 px-2 py-0.5 rounded shrink-0 font-bold">
                         {log.traceId.slice(0, 10)}...
@@ -229,18 +391,21 @@ export const LogsPage: React.FC = () => {
                     )}
                   </div>
 
-                  {/* Expanded Detail Panel */}
+                  {/* Expanded Details */}
                   {isExpanded && (
                     <div className="px-6 py-4 bg-zinc-950 border-t border-zinc-800 space-y-3.5">
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-zinc-800">
-                        <div className="flex items-center gap-3 text-[11px] text-zinc-400">
+                        <div className="flex flex-wrap items-center gap-3 text-[11px] text-zinc-400">
                           <span>
                             HOST: <strong className="text-white">{log.host || 'unknown'}</strong>
                           </span>
+
                           <span>•</span>
+
                           <span>
-                            ENV: <strong className="text-white">{log.environment}</strong>
+                            ENV: <strong className="text-white">{log.environment || 'unknown'}</strong>
                           </span>
+
                           {log.traceId && (
                             <>
                               <span>•</span>
@@ -251,47 +416,45 @@ export const LogsPage: React.FC = () => {
                           )}
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <Button
-                            variant="ghost"
-                            size="xs"
-                            onClick={() => copyToClipboard(log.message, log.id)}
-                            icon={<Copy className="w-3 h-3" />}
-                            className="text-[11px]"
-                          >
-                            {copiedId === log.id ? 'COPIED' : 'COPY LOG'}
-                          </Button>
-                        </div>
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          onClick={() => copyToClipboard(log.message, log.id)}
+                          icon={<Copy className="w-3 h-3" />}
+                          className="text-[11px]"
+                        >
+                          {copiedId === log.id ? 'COPIED' : 'COPY LOG'}
+                        </Button>
                       </div>
 
-                      {/* Full Message */}
                       <div>
                         <p className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold mb-1">
                           Full Message
                         </p>
+
                         <div className="p-3 rounded-lg bg-black border border-zinc-800 text-zinc-200 text-xs whitespace-pre-wrap leading-relaxed">
                           {log.message}
                         </div>
                       </div>
 
-                      {/* Stack Trace (if present) */}
                       {log.stackTrace && (
                         <div>
                           <p className="text-[11px] uppercase tracking-wider text-zinc-300 font-semibold mb-1">
                             Exception Stack Trace
                           </p>
+
                           <pre className="p-3 rounded-lg bg-zinc-900 border border-zinc-700 text-zinc-200 text-[11px] overflow-x-auto leading-relaxed">
                             {log.stackTrace}
                           </pre>
                         </div>
                       )}
 
-                      {/* Structured JSON Payload (if present) */}
                       {log.payload && (
                         <div>
                           <p className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold mb-1">
                             JSON Context Metadata
                           </p>
+
                           <pre className="p-3 rounded-lg bg-black border border-zinc-800 text-zinc-300 text-[11px] overflow-x-auto">
                             {JSON.stringify(log.payload, null, 2)}
                           </pre>
@@ -308,3 +471,5 @@ export const LogsPage: React.FC = () => {
     </div>
   );
 };
+
+export default LogsPage;
