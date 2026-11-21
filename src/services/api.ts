@@ -1,4 +1,9 @@
-import axios, { AxiosInstance, AxiosError } from 'axios';
+// APEX Centralized API Service Layer
+// Dashboard telemetry, observability, alerts, incidents and remediation APIs.
+// Mock data is used only when mock mode is explicitly enabled. In live mode,
+// backend failures are surfaced instead of silently replaced with demo data.
+
+import axios, { AxiosInstance } from 'axios';
 import {
   SystemOverview,
   MetricDataPoint,
@@ -31,53 +36,109 @@ import {
   mockRemediationActions,
   mockRemediationHistory,
   mockSystemReport,
-  generateTimeSeriesMetrics,
 } from './mockData';
 
-// Configurable base URL from environment
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+// ==========================================
+// API CONFIGURATION
+// ==========================================
 
-// Global mock mode state stored in localStorage or defaulting to env var
+// In production, set VITE_API_BASE_URL to the publicly reachable FastAPI URL.
+// The localhost fallback is intentionally development-only: a browser deployed
+// on Vercel cannot reach the developer's localhost. An empty production base URL
+// uses same-origin relative requests if the API is reverse-proxied by the host.
+const configuredApiBaseUrl = (
+  import.meta.env.VITE_API_BASE_URL as string | undefined
+)?.trim();
+
+export const API_BASE_URL = (
+  configuredApiBaseUrl || (import.meta.env.DEV ? 'http://localhost:8000' : '')
+).replace(/\/+$/, '');
+
+if (import.meta.env.PROD && !configuredApiBaseUrl) {
+  console.warn(
+    'APEX: VITE_API_BASE_URL is not configured. API requests will use the current website origin. ' +
+      'Set VITE_API_BASE_URL in Vercel if FastAPI is hosted separately.'
+  );
+}
+
+// Mock mode controls dashboard/demo data only. It does NOT bypass login, MFA,
+// authorization, or any backend authentication endpoint. A localStorage choice
+// takes precedence over the Vite environment default until it is cleared.
 const MOCK_STORAGE_KEY = 'apex_use_mock_data';
 
-export const getStoredMockMode = (): boolean => {
-  const stored = localStorage.getItem(MOCK_STORAGE_KEY);
-  if (stored !== null) {
-    return stored === 'true';
+const canUseLocalStorage = (): boolean => {
+  try {
+    return typeof window !== 'undefined' && !!window.localStorage;
+  } catch {
+    return false;
   }
+};
+
+export const getStoredMockMode = (): boolean => {
+  if (canUseLocalStorage()) {
+    try {
+      const stored = window.localStorage.getItem(MOCK_STORAGE_KEY);
+      if (stored === 'true') return true;
+      if (stored === 'false') return false;
+    } catch (error) {
+      console.warn('APEX: Could not read mock-mode preference.', error);
+    }
+  }
+
   return import.meta.env.VITE_USE_MOCK_DATA === 'true';
 };
 
 export const setStoredMockMode = (enabled: boolean): void => {
-  localStorage.setItem(MOCK_STORAGE_KEY, enabled ? 'true' : 'false');
+  if (!canUseLocalStorage()) return;
+
+  try {
+    window.localStorage.setItem(MOCK_STORAGE_KEY, String(enabled));
+  } catch (error) {
+    console.warn('APEX: Could not save mock-mode preference.', error);
+  }
 };
 
-// Axios instance with timeout and interceptors
+export const clearStoredMockMode = (): void => {
+  if (!canUseLocalStorage()) return;
+
+  try {
+    window.localStorage.removeItem(MOCK_STORAGE_KEY);
+  } catch (error) {
+    console.warn('APEX: Could not clear mock-mode preference.', error);
+  }
+};
+
+// ==========================================
+// AXIOS CLIENT & IN-MEMORY TOKEN VAULT
+// ==========================================
+
 export const apiClient: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 10000,
+  timeout: 15000,
   headers: {
+    Accept: 'application/json',
     'Content-Type': 'application/json',
-    'Accept': 'application/json',
   },
 });
-// In-memory authentication token
+
+// Access tokens remain in memory and are never persisted by this module.
 let accessToken: string | null = null;
 
 export const setAccessToken = (token: string | null): void => {
-    accessToken = token;
-};
-export const getAccessToken = (): string | null => {
-  return accessToken;
+  accessToken = token;
 };
 
-// Attach JWT to authenticated API requests
+export const getAccessToken = (): string | null => accessToken;
+
+// Attach the current bearer token to authenticated API requests.
 apiClient.interceptors.request.use((config) => {
-    if (accessToken) {
-        config.headers.Authorization = `Bearer ${accessToken}`;
-    }
+  if (accessToken) {
+    config.headers.Authorization = `Bearer ${accessToken}`;
+  } else if (config.headers.Authorization) {
+    delete config.headers.Authorization;
+  }
 
-    return config;
+  return config;
 });
 
 interface BackendMetricDataPoint {
@@ -175,12 +236,12 @@ class LocalMockStore {
       actionId,
       actionTitle: title,
       targetService: target,
-      executedBy: 'SecOps Console (User Confirmed)',
+      executedBy: 'APEX Mock Simulator (Demo Only)',
       timestamp: new Date().toLocaleDateString() + ' ' + new Date().toLocaleTimeString(),
       status: 'success',
       beforeHealth: 'Critical / Degrading',
       afterHealth: 'Stabilized (Healthy)',
-      logOutput: `[EXEC] Starting ${title} on ${target}...\n[INFO] Validated cluster state and permissions.\n[SUCCESS] Operation completed with status 200 OK. Metric recovery underway.`,
+      logOutput: `[SIMULATED] Starting demo action: ${title} on ${target}...\n[SIMULATED] No production infrastructure was changed.\n[DEMO] Mock remediation flow completed for demonstration purposes.`,
     };
 
     this.remediationHistory.unshift(historyItem);
@@ -431,8 +492,8 @@ export const api = {
       const response = await apiClient.get<ServerInfo[]>('/api/v1/infrastructure/servers');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/infrastructure/servers failed, falling back to mock mode.', err);
-      return [...mockStore.servers];
+      console.error('APEX: Failed to load infrastructure servers from the backend.', err);
+      throw err;
     }
   },
 
@@ -445,8 +506,8 @@ export const api = {
       const response = await apiClient.get<APMMetrics>('/api/v1/apm/metrics', { params: { range: timeRange } });
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/apm/metrics failed, falling back to mock mode.', err);
-      return { ...mockAPMMetrics };
+      console.error('APEX: Failed to load APM metrics from the backend.', err);
+      throw err;
     }
   },
 
@@ -470,8 +531,8 @@ export const api = {
       const response = await apiClient.get<LogEntry[]>('/api/v1/logs', { params });
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/logs failed, falling back to mock mode.', err);
-      return [...mockStore.logs];
+      console.error('APEX: Failed to load logs from the backend.', err);
+      throw err;
     }
   },
 
@@ -492,8 +553,8 @@ export const api = {
       const response = await apiClient.get<DistributedTrace[]>('/api/v1/traces', { params });
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/traces failed, falling back to mock mode.', err);
-      return [...mockStore.traces];
+      console.error('APEX: Failed to load traces from the backend.', err);
+      throw err;
     }
   },
 
@@ -506,8 +567,8 @@ export const api = {
       const response = await apiClient.get<AnomalyItem[]>('/api/v1/anomalies');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/anomalies failed, falling back to mock mode.', err);
-      return [...mockStore.anomalies];
+      console.error('APEX: Failed to load anomalies from the backend.', err);
+      throw err;
     }
   },
 
@@ -520,8 +581,8 @@ export const api = {
       const response = await apiClient.get<PredictionForecast[]>('/api/v1/predictions');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/predictions failed, falling back to mock mode.', err);
-      return [...mockStore.predictions];
+      console.error('APEX: Failed to load forecasts from the backend.', err);
+      throw err;
     }
   },
 
@@ -534,8 +595,8 @@ export const api = {
       const response = await apiClient.get<RootCauseAnalysis>('/api/v1/root-cause');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/root-cause failed, falling back to mock mode.', err);
-      return { ...mockStore.rootCause };
+      console.error('APEX: Failed to load root-cause analysis from the backend.', err);
+      throw err;
     }
   },
 
@@ -558,8 +619,8 @@ export const api = {
       const response = await apiClient.get<AlertItem[]>('/api/v1/alerts', { params });
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/alerts failed, falling back to mock mode.', err);
-      return [...mockStore.alerts];
+      console.error('APEX: Failed to load alerts from the backend.', err);
+      throw err;
     }
   },
 
@@ -574,9 +635,7 @@ export const api = {
       const response = await apiClient.patch<AlertItem>(`/api/v1/alerts/${id}`, updates);
       return response.data;
     } catch (err) {
-      console.warn(`API PATCH /api/v1/alerts/${id} failed, updating local mock store.`, err);
-      const updated = mockStore.updateAlert(id, updates);
-      if (updated) return updated;
+      console.error(`APEX: Failed to update alert ${id} in the backend.`, err);
       throw err;
     }
   },
@@ -590,8 +649,8 @@ export const api = {
       const response = await apiClient.get<IncidentItem[]>('/api/v1/incidents');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/incidents failed, falling back to mock mode.', err);
-      return [...mockStore.incidents];
+      console.error('APEX: Failed to load incidents from the backend.', err);
+      throw err;
     }
   },
 
@@ -606,9 +665,7 @@ export const api = {
       const response = await apiClient.patch<IncidentItem>(`/api/v1/incidents/${id}`, updates);
       return response.data;
     } catch (err) {
-      console.warn(`API PATCH /api/v1/incidents/${id} failed, updating local mock store.`, err);
-      const updated = mockStore.updateIncident(id, updates);
-      if (updated) return updated;
+      console.error(`APEX: Failed to update incident ${id} in the backend.`, err);
       throw err;
     }
   },
@@ -622,8 +679,8 @@ export const api = {
       const response = await apiClient.get<RemediationAction[]>('/api/v1/remediation/actions');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/remediation/actions failed, falling back to mock mode.', err);
-      return [...mockStore.remediationActions];
+      console.error('APEX: Failed to load remediation actions from the backend.', err);
+      throw err;
     }
   },
 
@@ -636,8 +693,8 @@ export const api = {
       const response = await apiClient.get<RemediationHistoryItem[]>('/api/v1/remediation/history');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/remediation/history failed, falling back to mock mode.', err);
-      return [...mockStore.remediationHistory];
+      console.error('APEX: Failed to load remediation history from the backend.', err);
+      throw err;
     }
   },
 
@@ -650,8 +707,8 @@ export const api = {
       const response = await apiClient.post<RemediationHistoryItem>('/api/v1/remediation/execute', { actionId, parameters });
       return response.data;
     } catch (err) {
-      console.warn('API POST /api/v1/remediation/execute failed, executing in local mock store.', err);
-      return mockStore.executeRemediation(actionId, parameters);
+      console.error('APEX: Backend remediation request failed; no local success will be fabricated.', err);
+      throw err;
     }
   },
 
@@ -664,8 +721,8 @@ export const api = {
       const response = await apiClient.get<SystemReport>('/api/v1/reports');
       return response.data;
     } catch (err) {
-      console.warn('API /api/v1/reports failed, falling back to mock mode.', err);
-      return { ...mockStore.report };
+      console.error('APEX: Failed to load reports from the backend.', err);
+      throw err;
     }
   },
 
@@ -676,9 +733,10 @@ export const api = {
       await apiClient.get('/api/v1/dashboard/overview', { timeout: 3000 });
       const latencyMs = Math.round(performance.now() - start);
       return { online: true, latencyMs };
-    } catch (err: any) {
+    } catch (err: unknown) {
       const latencyMs = Math.round(performance.now() - start);
-      return { online: false, latencyMs, error: err.message || 'Connection refused' };
+      const message = err instanceof Error ? err.message : 'Connection refused';
+      return { online: false, latencyMs, error: message };
     }
   },
 };
