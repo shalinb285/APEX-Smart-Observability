@@ -1,14 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   FileBarChart,
   Download,
-  Calendar,
   CheckCircle2,
   TrendingUp,
   Clock,
   AlertTriangle,
   Flame,
-  FileSpreadsheet,
 } from 'lucide-react';
 import { SystemReport } from '../types';
 import { api } from '../services/api';
@@ -28,61 +26,113 @@ import {
   Legend,
 } from 'recharts';
 
+type ReportData = Partial<SystemReport> & {
+  serviceAvailability?: unknown;
+  alertFrequency?: unknown;
+  performanceTrends?: unknown;
+};
+
+const asArray = <T,>(value: unknown): T[] => (Array.isArray(value) ? value as T[] : []);
+
+const csvCell = (value: unknown): string => {
+  const text = String(value ?? '');
+  return `"${text.replace(/"/g, '""')}"`;
+};
+
 export const ReportsPage: React.FC = () => {
-  const [report, setReport] = useState<SystemReport | null>(null);
+  const [report, setReport] = useState<ReportData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const fetchReport = useCallback(async () => {
+    setLoading(true);
+    setError('');
+
+    try {
+      const response: unknown = await api.getReports();
+
+      // Some API responses wrap the report in { data: ... } or { report: ... }.
+      // Normalize those shapes and reject non-object responses safely.
+      let candidate: any = response;
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+        candidate = candidate.report ?? candidate.data ?? candidate;
+      }
+
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        throw new Error('The reports API returned an unexpected response format.');
+      }
+
+      setReport({
+        ...candidate,
+        serviceAvailability: asArray(candidate.serviceAvailability),
+        alertFrequency: asArray(candidate.alertFrequency),
+        performanceTrends: asArray(candidate.performanceTrends),
+      });
+    } catch (err: any) {
+      console.error('Failed to load APEX reports:', err);
+      setReport(null);
+      setError(
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Unable to load reports from the backend.'
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    const fetchReport = async () => {
-      setLoading(true);
-      try {
-        const data = await api.getReports();
-        setReport(data);
-      } catch (e) {
-        console.error(e);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchReport();
-  }, []);
+    void fetchReport();
+  }, [fetchReport]);
+
+  const serviceAvailability = useMemo(
+    () => asArray<any>(report?.serviceAvailability),
+    [report]
+  );
+  const alertFrequency = useMemo(
+    () => asArray<any>(report?.alertFrequency),
+    [report]
+  );
+  const performanceTrends = useMemo(
+    () => asArray<any>(report?.performanceTrends),
+    [report]
+  );
 
   const handleExportCSV = () => {
     if (!report) return;
 
-    // Build CSV content
-    const rows = [
+    const rows: unknown[][] = [
       ['Service Name', 'Availability SLA (%)', 'Total Incidents', 'Avg Latency (ms)'],
-      ...report.serviceAvailability.map((s) => [
-        s.service,
-        `${s.uptimePercent}%`,
-        s.incidents.toString(),
-        `${s.avgLatencyMs} ms`,
+      ...serviceAvailability.map((service: any) => [
+        service?.service ?? '',
+        `${service?.uptimePercent ?? ''}%`,
+        service?.incidents ?? 0,
+        service?.avgLatencyMs ?? '',
       ]),
       [],
       ['Metric', 'Value'],
-      ['Overall Uptime', `${report.overallUptimePercent}%`],
-      ['Total Incidents', report.totalIncidents.toString()],
-      ['MTTR (Mean Time to Resolution)', `${report.mttrMinutes} min`],
-      ['MTTD (Mean Time to Detect)', `${report.mttdMinutes} min`],
-      ['Total Alerts', report.totalAlerts.toString()],
-      ['Generated At', report.generatedAt],
+      ['Overall Uptime', `${report.overallUptimePercent ?? ''}%`],
+      ['Total Incidents', report.totalIncidents ?? 0],
+      ['MTTR (Mean Time to Resolution)', `${report.mttrMinutes ?? ''} min`],
+      ['MTTD (Mean Time to Detect)', `${report.mttdMinutes ?? ''} min`],
+      ['Total Alerts', report.totalAlerts ?? 0],
+      ['Generated At', report.generatedAt ?? ''],
     ];
 
-    const csvContent =
-      'data:text/csv;charset=utf-8,' + rows.map((e) => e.join(',')).join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const csv = rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `APEX_SLA_Report_${Date.now()}.csv`);
+    link.href = url;
+    link.download = `APEX_SLA_Report_${Date.now()}.csv`;
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   return (
     <div className="space-y-6">
-      {/* Top Header with CSV Export */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-bold font-mono tracking-tight text-white flex items-center gap-2">
@@ -96,7 +146,7 @@ export const ReportsPage: React.FC = () => {
 
         <div className="flex items-center gap-2">
           <Badge variant="outline" className="text-xs font-mono">
-            PERIOD: {report?.period || 'November 2026'}
+            PERIOD: {report?.period || 'Latest'}
           </Badge>
           <Button
             variant="primary"
@@ -104,61 +154,66 @@ export const ReportsPage: React.FC = () => {
             onClick={handleExportCSV}
             icon={<Download className="w-4 h-4" />}
             className="text-xs font-mono"
+            disabled={!report || loading}
           >
             EXPORT AS CSV
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => void fetchReport()} disabled={loading}>
+            {loading ? 'LOADING...' : 'REFRESH'}
           </Button>
         </div>
       </div>
 
-      {/* KPI Cards Row */}
+      {error && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-700/50 bg-amber-950/20 p-4 text-sm text-amber-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-semibold">Report data unavailable</p>
+            <p className="mt-1 text-xs text-amber-200/80">{error}</p>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
         <MetricCard
           title="Overall Uptime"
-          value={report?.overallUptimePercent ?? 99.94}
+          value={report?.overallUptimePercent ?? 0}
           unit="%"
-          status="healthy"
+          status={report?.overallUptimePercent != null && report.overallUptimePercent >= 99.9 ? 'healthy' : undefined}
           icon={<CheckCircle2 className="w-4 h-4 text-white" />}
           subtitle="Target SLA: 99.90%"
         />
-
         <MetricCard
           title="MTTR (Resolution)"
-          value={report?.mttrMinutes ?? 18.5}
+          value={report?.mttrMinutes ?? 0}
           unit="min"
-          trend={{ value: -22.4, isUpGood: false, period: 'vs last mo' }}
           icon={<Clock className="w-4 h-4" />}
-          subtitle="Down from 23.8m"
+          subtitle="Mean time to resolution"
         />
-
         <MetricCard
           title="MTTD (Detection)"
-          value={report?.mttdMinutes ?? 3.2}
+          value={report?.mttdMinutes ?? 0}
           unit="min"
-          status="healthy"
           icon={<Clock className="w-4 h-4" />}
-          subtitle="AI anomaly lead time"
+          subtitle="Mean time to detect"
         />
-
         <MetricCard
           title="Total Incidents"
-          value={report?.totalIncidents ?? 14}
-          unit="this mo"
+          value={report?.totalIncidents ?? 0}
+          unit="this period"
           icon={<Flame className="w-4 h-4" />}
-          subtitle="12 resolved within SLA"
+          subtitle="Reported incidents"
         />
-
         <MetricCard
           title="Total Alerts"
-          value={report?.totalAlerts ?? 186}
+          value={report?.totalAlerts ?? 0}
           unit="signals"
           icon={<AlertTriangle className="w-4 h-4" />}
-          subtitle="84% auto-correlated"
+          subtitle="Reported alerts"
         />
       </div>
 
-      {/* Charts Row: Alert Frequency Distribution + Performance Trends */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Daily Alert Frequency Distribution Bar Chart (Monochrome) */}
         <Card>
           <CardHeader>
             <div>
@@ -171,48 +226,42 @@ export const ReportsPage: React.FC = () => {
           </CardHeader>
 
           <div style={{ width: '100%', height: 240 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={report?.alertFrequency || []} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272A" vertical={false} />
-                <XAxis
-                  dataKey="date"
-                  stroke="#52525B"
-                  tick={{ fill: '#A1A1AA', fontSize: 11, fontFamily: 'monospace' }}
-                  tickLine={false}
-                />
-                <YAxis
-                  stroke="#52525B"
-                  tick={{ fill: '#A1A1AA', fontSize: 11, fontFamily: 'monospace' }}
-                  tickLine={false}
-                />
-                <Tooltip
-                  content={({ active, payload, label }: any) => {
-                    if (active && payload && payload.length) {
+            {alertFrequency.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={alertFrequency} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#27272A" vertical={false} />
+                  <XAxis dataKey="date" stroke="#52525B" tick={{ fill: '#A1A1AA', fontSize: 11, fontFamily: 'monospace' }} tickLine={false} />
+                  <YAxis stroke="#52525B" tick={{ fill: '#A1A1AA', fontSize: 11, fontFamily: 'monospace' }} tickLine={false} />
+                  <Tooltip
+                    content={({ active, payload, label }: any) => {
+                      if (!active || !Array.isArray(payload) || payload.length === 0) return null;
                       return (
                         <div className="bg-black border border-zinc-700 p-2.5 rounded-xl text-xs font-mono shadow-xl">
                           <p className="text-zinc-400 mb-1 border-b border-zinc-800 pb-1">{label}</p>
-                          {payload.map((p: any, i: number) => (
-                            <div key={i} className="flex justify-between gap-4 py-0.5">
-                              <span className="text-zinc-300">{p.name}:</span>
-                              <span className="font-bold text-white">{p.value} alerts</span>
+                          {payload.map((item: any, index: number) => (
+                            <div key={`${item?.name ?? 'series'}-${index}`} className="flex justify-between gap-4 py-0.5">
+                              <span className="text-zinc-300">{item?.name ?? 'Alerts'}:</span>
+                              <span className="font-bold text-white">{item?.value ?? 0} alerts</span>
                             </div>
                           ))}
                         </div>
                       );
-                    }
-                    return null;
-                  }}
-                />
-                <Legend wrapperStyle={{ fontSize: '11px', fontFamily: 'monospace' }} />
-                <Bar dataKey="critical" name="Critical" fill="#FFFFFF" radius={[3, 3, 0, 0]} />
-                <Bar dataKey="warning" name="Warning" fill="#A1A1AA" radius={[3, 3, 0, 0]} />
-                <Bar dataKey="info" name="Info" fill="#52525B" radius={[3, 3, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+                    }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: '11px', fontFamily: 'monospace' }} />
+                  <Bar dataKey="critical" name="Critical" fill="#FFFFFF" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="warning" name="Warning" fill="#A1A1AA" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="info" name="Info" fill="#52525B" radius={[3, 3, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-full flex items-center justify-center text-xs font-mono text-zinc-500">
+                {loading ? 'LOADING ALERT HISTORY...' : 'NO ALERT HISTORY AVAILABLE'}
+              </div>
+            )}
           </div>
         </Card>
 
-        {/* Weekly Performance Trends */}
         <Card>
           <CardHeader>
             <div>
@@ -224,21 +273,26 @@ export const ReportsPage: React.FC = () => {
             </div>
           </CardHeader>
 
-          <RealtimeLineChart
-            data={report?.performanceTrends || []}
-            xAxisKey="week"
-            height={240}
-            domain={[0, 420]}
-            yAxisUnit="ms"
-            series={[
-              { key: 'p99LatencyMs', name: 'P99 Latency (ms)', strokeWidth: 2.2 },
-              { key: 'avgLatencyMs', name: 'Avg Latency (ms)', strokeWidth: 2 },
-            ]}
-          />
+          {performanceTrends.length > 0 ? (
+            <RealtimeLineChart
+              data={performanceTrends}
+              xAxisKey="week"
+              height={240}
+              domain={[0, 420]}
+              yAxisUnit="ms"
+              series={[
+                { key: 'p99LatencyMs', name: 'P99 Latency (ms)', strokeWidth: 2.2 },
+                { key: 'avgLatencyMs', name: 'Avg Latency (ms)', strokeWidth: 2 },
+              ]}
+            />
+          ) : (
+            <div className="h-[240px] flex items-center justify-center text-xs font-mono text-zinc-500">
+              {loading ? 'LOADING PERFORMANCE HISTORY...' : 'NO PERFORMANCE HISTORY AVAILABLE'}
+            </div>
+          )}
         </Card>
       </div>
 
-      {/* Service Availability Matrix */}
       <Card noPadding>
         <div className="px-5 py-4 border-b border-zinc-800 flex items-center justify-between bg-black">
           <div className="flex items-center gap-2">
@@ -264,18 +318,22 @@ export const ReportsPage: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/80">
-              {report?.serviceAvailability.map((svc) => {
-                const isCompliant = svc.uptimePercent >= 99.9;
+              {serviceAvailability.map((service: any, index: number) => {
+                const uptime = Number(service?.uptimePercent);
+                const isCompliant = Number.isFinite(uptime) && uptime >= 99.9;
+                const name = service?.service || `Service ${index + 1}`;
                 return (
-                  <tr key={svc.service} className="hover:bg-zinc-900/60 transition-colors">
-                    <td className="py-3 px-4 font-semibold text-white">{svc.service}</td>
+                  <tr key={`${name}-${index}`} className="hover:bg-zinc-900/60 transition-colors">
+                    <td className="py-3 px-4 font-semibold text-white">{name}</td>
                     <td className="py-3 px-4">
                       <span className="font-bold text-white">
-                        {svc.uptimePercent}%
+                        {Number.isFinite(uptime) ? `${uptime}%` : '—'}
                       </span>
                     </td>
-                    <td className="py-3 px-4 text-zinc-300">{svc.incidents}</td>
-                    <td className="py-3 px-4 text-zinc-300">{svc.avgLatencyMs} ms</td>
+                    <td className="py-3 px-4 text-zinc-300">{service?.incidents ?? '—'}</td>
+                    <td className="py-3 px-4 text-zinc-300">
+                      {service?.avgLatencyMs != null ? `${service.avgLatencyMs} ms` : '—'}
+                    </td>
                     <td className="py-3 px-4 text-right">
                       <Badge variant={isCompliant ? 'healthy' : 'warning'}>
                         {isCompliant ? 'PASS' : 'DEVIATION'}
@@ -284,6 +342,13 @@ export const ReportsPage: React.FC = () => {
                   </tr>
                 );
               })}
+              {!loading && serviceAvailability.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-8 px-4 text-center text-zinc-500">
+                    No service availability records returned by the API.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -291,3 +356,5 @@ export const ReportsPage: React.FC = () => {
     </div>
   );
 };
+
+export default ReportsPage;
