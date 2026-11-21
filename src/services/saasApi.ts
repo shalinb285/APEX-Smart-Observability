@@ -35,6 +35,9 @@ interface BackendUserResponse {
     full_name?: string | null;
     role: string;
     is_active: boolean;
+    // Optional backend MFA status. The API must return this field
+    // for the frontend to display the account's actual MFA setting.
+    mfa_enabled?: boolean;
 }
 
 const mapBackendRole = (role: string): UserRole => {
@@ -53,7 +56,7 @@ const mapBackendUser = (backendUser: BackendUserResponse): User => ({
     fullName: backendUser.full_name || backendUser.username,
     avatarUrl: '',
     emailVerified: false,
-    mfaEnabled: false,
+    mfaEnabled: backendUser.mfa_enabled === true,
     currentOrgId: 'default',
     roles: {
         default: mapBackendRole(backendUser.role),
@@ -67,7 +70,8 @@ const mockUser: User = {
   fullName: 'Alex Chen',
   avatarUrl: '',
   emailVerified: true,
-  mfaEnabled: true,
+  // Demo-only mock profile. Keep production MFA enforcement in the backend.
+  mfaEnabled: false,
   currentOrgId: 'org-apex-enterprise',
   roles: {
     'org-apex-enterprise': 'Owner',
@@ -118,7 +122,9 @@ const mockOrganizations: Organization[] = [
       },
     ],
     settings: {
-      enforceMfa: true,
+      // Demo-only mock organization policy. This does not change
+      // the real backend MFA policy or disable production MFA.
+      enforceMfa: false,
       ipAllowlist: ['198.51.100.0/24', '203.0.113.44/32'],
       allowedEmailDomains: ['enterprise-apex.internal', 'apex.io'],
     },
