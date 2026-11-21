@@ -12,14 +12,15 @@ export const LoginPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+
+    if (loading) return;
 
     setError('');
     setLoading(true);
 
     try {
-      // Accept either username or email address
       const result = await login(identifier.trim(), password);
 
       if (result.mfaRequired) {
@@ -33,17 +34,44 @@ export const LoginPage: React.FC = () => {
       }
 
       navigate('/', { replace: true });
-
     } catch (err: any) {
-      setError(
-        err?.response?.data?.detail ||
-        err?.message ||
-        'Login failed. Please check your username/email and password.'
-      );
+      const detail = err?.response?.data?.detail;
 
+      let message = 'Login failed. Please check your username/email and password.';
+
+      if (typeof detail === 'string') {
+        message = detail;
+      } else if (Array.isArray(detail)) {
+        message = detail.map((item: any) => item.msg).join(', ');
+      } else if (typeof err?.message === 'string') {
+        message = err.message;
+      }
+
+      setError(message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    boxSizing: 'border-box',
+    padding: '13px',
+    marginBottom: '22px',
+    background: '#080b11',
+    color: '#fff',
+    border: '1px solid #303b4c',
+    borderRadius: '7px',
+    outline: 'none',
+    fontFamily: 'monospace',
+    fontSize: '13px'
+  };
+
+  const labelStyle: React.CSSProperties = {
+    display: 'block',
+    marginBottom: '8px',
+    fontSize: '12px',
+    color: '#e8edf5'
   };
 
   return (
@@ -105,74 +133,40 @@ export const LoginPage: React.FC = () => {
 
         {/* Login Form */}
         <form onSubmit={handleLogin}>
-
-          {/* Username or Email */}
-          <label
-            style={{
-              display: 'block',
-              marginBottom: '8px',
-              fontSize: '12px'
-            }}
-          >
-            USERNAME OR GMAIL
+          <label style={labelStyle}>
+            USERNAME OR EMAIL ADDRESS
           </label>
 
           <input
             type="text"
             value={identifier}
-            onChange={e => setIdentifier(e.target.value)}
-            placeholder="Enter username or email address"
+            onChange={(e) => setIdentifier(e.target.value)}
+            placeholder="Enter username or Gmail address"
             required
             autoComplete="username"
             autoCapitalize="none"
             spellCheck={false}
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              padding: '13px',
-              marginBottom: '22px',
-              background: '#080b11',
-              color: '#fff',
-              border: '1px solid #303b4c',
-              borderRadius: '7px',
-              outline: 'none'
-            }}
+            style={inputStyle}
           />
 
-          {/* Password */}
-          <label
-            style={{
-              display: 'block',
-              marginBottom: '8px',
-              fontSize: '12px'
-            }}
-          >
+          <label style={labelStyle}>
             PASSWORD
           </label>
 
           <input
             type="password"
             value={password}
-            onChange={e => setPassword(e.target.value)}
+            onChange={(e) => setPassword(e.target.value)}
             placeholder="Enter your password"
             required
             autoComplete="current-password"
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              padding: '13px',
-              marginBottom: '22px',
-              background: '#080b11',
-              color: '#fff',
-              border: '1px solid #303b4c',
-              borderRadius: '7px',
-              outline: 'none'
-            }}
+            style={inputStyle}
           />
 
           {/* Error Message */}
           {error && (
             <div
+              role="alert"
               style={{
                 padding: '12px',
                 marginBottom: '18px',
@@ -180,7 +174,9 @@ export const LoginPage: React.FC = () => {
                 border: '1px solid #873b40',
                 color: '#ff9b9b',
                 borderRadius: '7px',
-                fontSize: '12px'
+                fontSize: '12px',
+                lineHeight: '1.6',
+                overflowWrap: 'anywhere'
               }}
             >
               {error}
@@ -190,7 +186,7 @@ export const LoginPage: React.FC = () => {
           {/* Sign In Button */}
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !identifier.trim() || !password}
             style={{
               width: '100%',
               padding: '14px',
@@ -200,7 +196,8 @@ export const LoginPage: React.FC = () => {
               borderRadius: '7px',
               fontWeight: 700,
               cursor: loading ? 'wait' : 'pointer',
-              letterSpacing: '1px'
+              letterSpacing: '1px',
+              opacity: !identifier.trim() || !password ? 0.65 : 1
             }}
           >
             {loading ? 'AUTHENTICATING...' : 'SIGN IN TO APEX'}
@@ -213,7 +210,8 @@ export const LoginPage: React.FC = () => {
             textAlign: 'center',
             color: '#66758a',
             fontSize: '10px',
-            marginTop: '28px'
+            marginTop: '28px',
+            lineHeight: '1.6'
           }}
         >
           SECURE OPERATOR ACCESS · APEX SMART OBSERVABILITY
@@ -224,4 +222,3 @@ export const LoginPage: React.FC = () => {
 };
 
 export default LoginPage;
-```
