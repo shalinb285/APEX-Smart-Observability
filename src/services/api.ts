@@ -45,7 +45,7 @@ export const getStoredMockMode = (): boolean => {
   if (stored !== null) {
     return stored === 'true';
   }
-  return import.meta.env.VITE_USE_MOCK_DATA !== 'true';
+  return import.meta.env.VITE_USE_MOCK_DATA === 'true';
 };
 
 export const setStoredMockMode = (enabled: boolean): void => {
