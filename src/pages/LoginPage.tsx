@@ -23,31 +23,39 @@ export const LoginPage: React.FC = () => {
     try {
       const result = await login(identifier.trim(), password);
 
-      if (result.mfaRequired) {
+      // MFA must be completed before granting access.
+      if (result?.mfaRequired) {
         await logout();
 
         setError(
-          'This account requires MFA. Server-side MFA verification has not yet been implemented.'
+          'Additional authentication is required for this account. MFA verification is not currently available. Please use an authorized demo account or contact the administrator.'
         );
 
         return;
       }
 
+      // Successful authentication
       navigate('/', { replace: true });
+
     } catch (err: any) {
       const detail = err?.response?.data?.detail;
 
-      let message = 'Login failed. Please check your username/email and password.';
+      let message =
+        'Authentication failed. Please verify your credentials and try again.';
 
       if (typeof detail === 'string') {
         message = detail;
       } else if (Array.isArray(detail)) {
-        message = detail.map((item: any) => item.msg).join(', ');
+        message = detail
+          .map((item: any) => item.msg)
+          .filter(Boolean)
+          .join(', ');
       } else if (typeof err?.message === 'string') {
         message = err.message;
       }
 
       setError(message);
+
     } finally {
       setLoading(false);
     }
@@ -131,7 +139,6 @@ export const LoginPage: React.FC = () => {
           </p>
         </div>
 
-        {/* Login Form */}
         <form onSubmit={handleLogin}>
           <label style={labelStyle}>
             USERNAME OR EMAIL ADDRESS
@@ -141,7 +148,7 @@ export const LoginPage: React.FC = () => {
             type="text"
             value={identifier}
             onChange={(e) => setIdentifier(e.target.value)}
-            placeholder="Enter username or Gmail address"
+            placeholder="Enter username or email"
             required
             autoComplete="username"
             autoCapitalize="none"
@@ -163,10 +170,11 @@ export const LoginPage: React.FC = () => {
             style={inputStyle}
           />
 
-          {/* Error Message */}
+          {/* Authentication Error */}
           {error && (
             <div
               role="alert"
+              aria-live="polite"
               style={{
                 padding: '12px',
                 marginBottom: '18px',
@@ -183,7 +191,6 @@ export const LoginPage: React.FC = () => {
             </div>
           )}
 
-          {/* Sign In Button */}
           <button
             type="submit"
             disabled={loading || !identifier.trim() || !password}
@@ -197,14 +204,14 @@ export const LoginPage: React.FC = () => {
               fontWeight: 700,
               cursor: loading ? 'wait' : 'pointer',
               letterSpacing: '1px',
-              opacity: !identifier.trim() || !password ? 0.65 : 1
+              opacity:
+                loading || !identifier.trim() || !password ? 0.65 : 1
             }}
           >
             {loading ? 'AUTHENTICATING...' : 'SIGN IN TO APEX'}
           </button>
         </form>
 
-        {/* Footer */}
         <p
           style={{
             textAlign: 'center',
